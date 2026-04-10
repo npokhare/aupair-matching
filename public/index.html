@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AuPair Rematch</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header>
+        <h1>AuPair Rematch</h1>
+        <p>Anonymous first. Consent before reveal. Privacy by design.</p>
+      </header>
+
+      <section class="card" id="authCard">
+        <h2>1. Sign In</h2>
+        <button id="loginBtn">Sign in with Google</button>
+        <button id="demoLoginBtn" class="secondary">Local demo login</button>
+        <button id="logoutBtn" class="secondary">Sign out</button>
+        <p id="authState">Not signed in</p>
+      </section>
+
+      <section class="card" id="profileCard">
+        <h2>2. Anonymous Profile</h2>
+        <form id="profileForm">
+          <label>Role</label>
+          <select id="role">
+            <option value="aupair">Au pair</option>
+            <option value="host">Host family</option>
+          </select>
+
+          <label>Alias</label>
+          <input id="alias" maxlength="40" placeholder="happy-lotus" />
+
+          <label>Region</label>
+          <input id="region" maxlength="64" placeholder="Berlin" />
+
+          <label>Interests (comma separated)</label>
+          <input id="interests" maxlength="120" placeholder="sports, travel, music" />
+
+          <label>Availability</label>
+          <input id="availability" maxlength="64" placeholder="immediate" />
+
+          <label>About</label>
+          <textarea id="about" maxlength="300"></textarea>
+
+          <button type="submit">Save profile</button>
+        </form>
+      </section>
+
+      <section class="card" id="matchingCard">
+        <h2>3. Matching</h2>
+        <button id="loadCandidatesBtn">Load candidates</button>
+        <div id="candidates"></div>
+      </section>
+
+      <section class="card" id="chatCard">
+        <h2>4. Chat (after reveal)</h2>
+        <input id="threadId" placeholder="match id" />
+        <button id="revealBtn">I consent to reveal</button>
+        <textarea id="messageText" maxlength="2000" placeholder="Type message"></textarea>
+        <button id="sendMessageBtn">Send message</button>
+      </section>
+
+      <section class="card" id="deleteCard">
+        <h2>5. Delete My Data</h2>
+        <button id="requestDeleteBtn" class="danger">Request deletion</button>
+        <button id="runDeleteBtn" class="danger secondary">Run deletion now</button>
+      </section>
+
+      <section class="card">
+        <h2>Activity</h2>
+        <pre id="logs"></pre>
+      </section>
+    </main>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

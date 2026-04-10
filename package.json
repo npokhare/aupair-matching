@@ -1,0 +1,17 @@
+﻿{
+  "name": "aupair-matching",
+  "version": "1.0.0",
+  "description": "Privacy-first au pair rematch app on Firebase",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"No tests configured yet\"",
+    "emulators": "firebase emulators:start",
+    "deploy": "firebase deploy",
+    "deploy:rules": "firebase deploy --only firestore:rules",
+    "deploy:functions": "firebase deploy --only functions",
+    "deploy:hosting": "firebase deploy --only hosting"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}

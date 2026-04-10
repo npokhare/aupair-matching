@@ -1,0 +1,6 @@
+﻿{
+  "projects": {
+    "default": "aupair-matching",
+    "demo": "demo-aupair-matching"
+  }
+}
