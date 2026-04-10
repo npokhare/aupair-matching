@@ -1,600 +1,1765 @@
+// ============================================================
+// app.js — AuPair Rematch
+// ============================================================
+
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
 import {
-  getAuth,
-  GoogleAuthProvider,
-  signInWithPopup,
-  signInAnonymously,
-  signOut,
-  onAuthStateChanged,
+  getAuth, GoogleAuthProvider, signInWithPopup,
+  signInAnonymously, signOut, onAuthStateChanged,
   connectAuthEmulator
 } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
 import {
-  getFirestore,
-  connectFirestoreEmulator,
-  doc,
-  getDoc,
-  setDoc,
-  updateDoc,
-  deleteDoc,
-  collection,
-  addDoc,
-  query,
-  where,
-  getDocs,
-  serverTimestamp,
-  increment,
-  limit
+  getFirestore, connectFirestoreEmulator,
+  doc, getDoc, setDoc, updateDoc, deleteDoc,
+  collection, addDoc, getDocs,
+  query, where, limit, serverTimestamp, increment
 } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
 
+// ── Config ──────────────────────────────────────────────────
 const useLocalEmulators = ["localhost", "127.0.0.1"].includes(window.location.hostname);
 
-const baseFirebaseConfig = {
-  apiKey: "REPLACE_API_KEY",
-  authDomain: "aupair-matching.firebaseapp.com",
-  projectId: "aupair-matching",
-  storageBucket: "aupair-matching.appspot.com",
+const baseConfig = {
+  apiKey:            "REPLACE_API_KEY",
+  authDomain:        "aupair-matching.firebaseapp.com",
+  projectId:         "aupair-matching",
+  storageBucket:     "aupair-matching.appspot.com",
   messagingSenderId: "REPLACE_SENDER_ID",
-  appId: "REPLACE_APP_ID"
+  appId:             "REPLACE_APP_ID"
 };
 
-const el = {
-  loginBtn: document.getElementById("loginBtn"),
-  demoLoginBtn: document.getElementById("demoLoginBtn"),
-  logoutBtn: document.getElementById("logoutBtn"),
-  authState: document.getElementById("authState"),
-  profileForm: document.getElementById("profileForm"),
-  role: document.getElementById("role"),
-  alias: document.getElementById("alias"),
-  region: document.getElementById("region"),
-  interests: document.getElementById("interests"),
-  availability: document.getElementById("availability"),
-  about: document.getElementById("about"),
-  loadCandidatesBtn: document.getElementById("loadCandidatesBtn"),
-  candidates: document.getElementById("candidates"),
-  threadId: document.getElementById("threadId"),
-  revealBtn: document.getElementById("revealBtn"),
-  messageText: document.getElementById("messageText"),
-  sendMessageBtn: document.getElementById("sendMessageBtn"),
-  requestDeleteBtn: document.getElementById("requestDeleteBtn"),
-  runDeleteBtn: document.getElementById("runDeleteBtn"),
-  logs: document.getElementById("logs")
-};
+// ── State ───────────────────────────────────────────────────
+// Set this to your Google account email to enable the admin dashboard.
+// Leave empty ("") to disable admin mode.
+const ADMIN_EMAIL = "niru.nirajanpokharel@gmail.com";
 
-let currentUser = null;
-let app = null;
-let auth = null;
-let db = null;
+let selectedRole       = "aupair";
+let currentUser        = null;
+let isEditingProfile   = false;
+let currentMatchId     = null;
+let currentMatchState  = "mutual_match";
+let app, auth, db;
 const provider = new GoogleAuthProvider();
+const UI_TAB_KEY = "am_active_tab";
+const UI_MATCH_KEY = "am_active_match";
+const UNMATCH_COOLDOWN_DAYS = 30;
+const CHAT_RULES_KEY = "am_chat_rules_v1";
+const LEGAL_VERSION = "2026-04-10";
+const LEGAL_PENDING_KEY = "am_pending_legal_acceptance";
 
-function localDemoConfig() {
-  return {
-    apiKey: "demo-key",
-    authDomain: "demo-aupair-matching.firebaseapp.com",
-    projectId: "demo-aupair-matching",
-    storageBucket: "demo-aupair-matching.appspot.com",
-    messagingSenderId: "000000000000",
-    appId: "1:000000000000:web:demo"
-  };
+// ── DOM helper ───────────────────────────────────────────────
+const $ = (id) => document.getElementById(id);
+
+function validateLegalChecks() {
+  const ageOk = $("ageConfirm")?.checked;
+  const legalOk = $("legalConfirm")?.checked;
+  const errorEl = $("authLegalError");
+
+  if (!ageOk || !legalOk) {
+    if (errorEl) errorEl.textContent = "Please confirm age (18+) and accept Terms + Privacy.";
+    return false;
+  }
+
+  if (errorEl) errorEl.textContent = "";
+  sessionStorage.setItem(LEGAL_PENDING_KEY, JSON.stringify({
+    version: LEGAL_VERSION,
+    acceptedAtMs: Date.now()
+  }));
+  return true;
 }
 
-async function resolveFirebaseConfig() {
-  if (useLocalEmulators) {
-    return localDemoConfig();
-  }
-
-  if (!baseFirebaseConfig.apiKey.startsWith("REPLACE_")) {
-    return baseFirebaseConfig;
-  }
+async function persistPendingLegalAcceptance(uid) {
+  const raw = sessionStorage.getItem(LEGAL_PENDING_KEY);
+  if (!raw || !db) return;
 
   try {
-    const res = await fetch("/__/firebase/init.json", { cache: "no-store" });
-    if (!res.ok) {
-      throw new Error(`init.json request failed: ${res.status}`);
-    }
-    const hostedConfig = await res.json();
-    if (!hostedConfig.apiKey) {
-      throw new Error("init.json missing apiKey");
-    }
-    return {
-      apiKey: hostedConfig.apiKey,
-      authDomain: hostedConfig.authDomain || baseFirebaseConfig.authDomain,
-      projectId: hostedConfig.projectId || baseFirebaseConfig.projectId,
-      storageBucket: hostedConfig.storageBucket || baseFirebaseConfig.storageBucket,
-      messagingSenderId: hostedConfig.messagingSenderId || "",
-      appId: hostedConfig.appId || ""
+    const parsed = JSON.parse(raw);
+    if (!parsed?.version || !parsed?.acceptedAtMs) return;
+
+    await setDoc(doc(db, "users", uid), {
+      legalAcceptance: {
+        version: parsed.version,
+        acceptedAtMs: Number(parsed.acceptedAtMs),
+        acceptedAt: serverTimestamp(),
+        source: "auth-checkbox"
+      },
+      updatedAt: serverTimestamp()
+    }, { merge: true });
+  } catch (_err) {
+    // Non-critical; user flow should continue.
+  } finally {
+    sessionStorage.removeItem(LEGAL_PENDING_KEY);
+  }
+}
+
+// ── View routing ─────────────────────────────────────────────
+function showView(id) {
+  document.querySelectorAll(".view").forEach(v => v.classList.remove("active"));
+  $(id).classList.add("active");
+}
+
+function showTab(name) {
+  document.querySelectorAll(".tab-pane").forEach(p => p.classList.remove("active"));
+  document.querySelectorAll(".nav-btn").forEach(b => b.classList.remove("active"));
+  $("tab-" + name).classList.add("active");
+  document.querySelector(`[data-tab="${name}"]`)?.classList.add("active");
+  if (["discover", "matches", "profile"].includes(name)) {
+    localStorage.setItem(UI_TAB_KEY, name);
+  }
+}
+
+function storedTab() {
+  const tab = localStorage.getItem(UI_TAB_KEY);
+  return ["discover", "matches", "profile"].includes(tab) ? tab : "discover";
+}
+
+function storedMatchId() {
+  return localStorage.getItem(UI_MATCH_KEY) || "";
+}
+
+function setStoredMatchId(matchId) {
+  if (!matchId) {
+    localStorage.removeItem(UI_MATCH_KEY);
+    return;
+  }
+  localStorage.setItem(UI_MATCH_KEY, matchId);
+}
+
+function truncateText(text, maxLen = 180) {
+  const normalized = String(text || "").trim();
+  if (!normalized) return "";
+  if (normalized.length <= maxLen) return normalized;
+  return `${normalized.slice(0, maxLen).trimEnd()}...`;
+}
+
+async function getLikeCount(uid) {
+  const myActionsSnap = await getDocs(
+    query(collection(db, "matchActions"), where("actorUid", "==", uid), limit(50))
+  );
+  let likeCount = 0;
+  myActionsSnap.forEach((a) => {
+    if (a.data()?.action === "like") likeCount += 1;
+  });
+  return likeCount;
+}
+
+async function updateLikeQuotaUI() {
+  if (!currentUser || !db || !$("likeQuotaText")) return;
+  try {
+    const likeCount = await getLikeCount(currentUser.uid);
+    $("likeQuotaText").textContent = `Selected: ${likeCount}/3`;
+  } catch (_err) {
+    $("likeQuotaText").textContent = "Selected: ?/3";
+  }
+}
+
+function showLoading(on) {
+  $("loadingOverlay").classList.toggle("active", on);
+}
+
+// ── Toast notifications ──────────────────────────────────────
+const TOAST_ICONS = { info: "ℹ️", success: "✅", error: "❌", warning: "⚠️" };
+
+function toast(message, type = "info", durationMs = 4000) {
+  const container = $("toastContainer");
+  const el = document.createElement("div");
+  el.className = `toast ${type}`;
+  el.innerHTML = `
+    <span class="toast-icon">${TOAST_ICONS[type] || TOAST_ICONS.info}</span>
+    <span>${escHtml(message)}</span>
+    <button class="toast-close" aria-label="Dismiss">×</button>
+  `;
+  el.querySelector(".toast-close").addEventListener("click", () => el.remove());
+  container.prepend(el);
+  if (durationMs > 0) setTimeout(() => el.remove(), durationMs);
+}
+
+// ── Confirm modal ────────────────────────────────────────────
+// Returns a Promise<boolean> — resolves true on confirm, false on cancel.
+function showConfirm(message, confirmLabel = "Confirm", dangerous = true) {
+  return new Promise(resolve => {
+    const backdrop = $("confirmModal");
+    const msgEl    = $("modalMsg");
+    const confirmBtn = $("modalConfirm");
+    const cancelBtn  = $("modalCancel");
+
+    msgEl.textContent    = message;
+    confirmBtn.textContent = confirmLabel;
+    confirmBtn.className = dangerous ? "modal-confirm" : "modal-confirm safe";
+    backdrop.hidden = false;
+    backdrop.setAttribute("aria-hidden", "false");
+    backdrop.classList.add("active");
+
+    const cleanup = (result) => {
+      backdrop.classList.remove("active");
+      backdrop.setAttribute("aria-hidden", "true");
+      backdrop.hidden = true;
+      confirmBtn.replaceWith(confirmBtn.cloneNode(true));
+      cancelBtn.replaceWith(cancelBtn.cloneNode(true));
+      resolve(result);
     };
-  } catch (err) {
-    log("Firebase config missing", {
-      message: "Create a Firebase Web App and set SDK config or allow Hosting auto-init."
+
+    $("modalConfirm").addEventListener("click", () => cleanup(true),  { once: true });
+    $("modalCancel") .addEventListener("click", () => cleanup(false), { once: true });
+  });
+}
+
+// ── Chat community guidelines ─────────────────────────────────
+function hasChatRulesAccepted() {
+  return localStorage.getItem(CHAT_RULES_KEY) === "true";
+}
+
+function showChatRulesModal() {
+  return new Promise((resolve) => {
+    const modal      = $("chatRulesModal");
+    const acceptBtn  = $("chatRulesAccept");
+    const declineBtn = $("chatRulesDecline");
+
+    modal.hidden = false;
+    modal.setAttribute("aria-hidden", "false");
+    modal.classList.add("active");
+
+    const cleanup = (accepted) => {
+      modal.classList.remove("active");
+      modal.setAttribute("aria-hidden", "true");
+      modal.hidden = true;
+      acceptBtn.replaceWith(acceptBtn.cloneNode(true));
+      declineBtn.replaceWith(declineBtn.cloneNode(true));
+      if (accepted) localStorage.setItem(CHAT_RULES_KEY, "true");
+      resolve(accepted);
+    };
+
+    $("chatRulesAccept") .addEventListener("click", () => cleanup(true),  { once: true });
+    $("chatRulesDecline").addEventListener("click", () => cleanup(false), { once: true });
+  });
+}
+
+// ── Datalist helpers ─────────────────────────────────────────
+function setDatalistOptions(listId, values) {
+  const dl = document.getElementById(listId);
+  if (!dl) return;
+  const existing = new Set(Array.from(dl.options).map(o => o.value.toLowerCase()));
+  values.forEach(v => {
+    if (v && !existing.has(v.toLowerCase())) {
+      const opt = document.createElement("option");
+      opt.value = v;
+      dl.appendChild(opt);
+      existing.add(v.toLowerCase());
+    }
+  });
+}
+
+async function populateRegionList() {
+  if (!db) return;
+  try {
+    const snap = await getDocs(query(collection(db, "profiles"), where("profileVisible", "==", true), limit(100)));
+    const regions = [];
+    snap.forEach(d => {
+      const r = (d.data().region || "").trim();
+      if (r) regions.push(r);
     });
-    console.error(err);
+    setDatalistOptions("regionList", [...new Set(regions)]);
+  } catch (_err) {
+    // non-critical
+  }
+}
+
+// ── Au-pair field visibility ──────────────────────────────────
+function updateAupairFields(role) {
+  document.querySelectorAll(".aupair-field").forEach(el => {
+    el.classList.toggle("visible", role === "aupair");
+  });
+  const chip = $("onboardRoleChip");
+  const label = role === "host" ? "🏡 Host Family" : "🧳 Au Pair";
+  chip.innerHTML = `${label} <span class="role-chip-switch">switch ⇄</span>`;
+}
+
+// Toggle role chip
+$("onboardRoleChip").addEventListener("click", () => {
+  const newRole = $("role").value === "host" ? "aupair" : "host";
+  selectedRole       = newRole;
+  $("role").value    = newRole;
+  if (newRole === "host") {
+    $("onboardSub").textContent = "Tell potential au pairs about your family — anonymously.";
+    $("aboutLabel").textContent = "About your family";
+  } else {
+    $("onboardSub").textContent = "Tell us about yourself — nothing here reveals your real identity.";
+    $("aboutLabel").textContent = "About you";
+  }
+  updateAupairFields(newRole);
+});
+
+// ── Firebase config ──────────────────────────────────────────
+async function resolveFirebaseConfig() {
+  if (useLocalEmulators) {
+    return {
+      apiKey:            "demo-key",
+      authDomain:        "demo-aupair-matching.firebaseapp.com",
+      projectId:         "demo-aupair-matching",
+      storageBucket:     "demo-aupair-matching.appspot.com",
+      messagingSenderId: "000000000000",
+      appId:             "1:000000000000:web:demo"
+    };
+  }
+  if (!baseConfig.apiKey.startsWith("REPLACE_")) return baseConfig;
+  try {
+    const res = await fetch("/__/firebase/init.json", { cache: "no-store" });
+    if (!res.ok) throw new Error(`init.json HTTP ${res.status}`);
+    const cfg = await res.json();
+    if (!cfg.apiKey) throw new Error("init.json missing apiKey");
+    return { ...baseConfig, ...cfg };
+  } catch (err) {
+    console.error("Firebase config error:", err);
     return null;
   }
 }
 
 async function initFirebase() {
-  const resolvedConfig = await resolveFirebaseConfig();
-  if (!resolvedConfig) {
-    return false;
-  }
+  const cfg = await resolveFirebaseConfig();
+  if (!cfg) return false;
 
-  app = initializeApp(resolvedConfig);
+  app  = initializeApp(cfg);
   auth = getAuth(app);
-  db = getFirestore(app);
+  db   = getFirestore(app);
 
   if (useLocalEmulators) {
     connectAuthEmulator(auth, "http://127.0.0.1:9099", { disableWarnings: true });
     connectFirestoreEmulator(db, "127.0.0.1", 8085);
+    $("demoLoginBtn").style.removeProperty("display");
   } else {
-    el.demoLoginBtn.style.display = "none";
+    $("demoLoginBtn").style.display = "none";
   }
 
-  onAuthStateChanged(auth, async (user) => {
-    currentUser = user;
-    if (!user) {
-      el.authState.textContent = "Not signed in";
-      return;
-    }
-
-    const label = user.email || `demo-user:${user.uid.slice(0, 6)}`;
-    el.authState.textContent = `Signed in as ${label}`;
-
-    try {
-      await ensureUserDocs(user.uid);
-      log("User ready", { uid: user.uid });
-    } catch (err) {
-      log("User init failed", { message: err.message });
-    }
-  });
-
+  onAuthStateChanged(auth, handleAuthChange);
+  populateRegionList();
   return true;
 }
 
-const firebaseReady = initFirebase();
+// ── Auth state handler ───────────────────────────────────────
+async function handleAuthChange(user) {
+  currentUser = user;
+  showLoading(false);
 
-async function requireFirebaseReady() {
-  const ok = await firebaseReady;
-  if (!ok || !auth || !db) {
-    log("Firebase not configured for production yet.");
+  if (!user) {
+    showView("view-landing");
+    return;
+  }
+
+  const isAdminUser = Boolean(ADMIN_EMAIL && user.email === ADMIN_EMAIL);
+  const isAdminUserMode = Boolean(sessionStorage.getItem("am_admin_user_mode"));
+
+  // Admin shortcut — bypass normal profile flow unless user chose user-mode
+  if (isAdminUser && !isAdminUserMode) {
+    $("adminUserPill").textContent = user.email;
+    showView("view-admin");
+    loadAdminDashboard().catch(err => console.error("Admin dashboard error:", err));
+    return;
+  }
+
+  // If admin is browsing as regular user, keep a visible way back to admin.
+  if ($("switchToAdminBtn")) {
+    $("switchToAdminBtn").hidden = !isAdminUser;
+  }
+
+  $("userPill").textContent = user.email || `demo:${user.uid.slice(0, 6)}`;
+
+  showLoading(true);
+  try {
+    await ensureUserDocs(user.uid);
+    await persistPendingLegalAcceptance(user.uid);
+    const profileSnap = await getDoc(doc(db, "profiles", user.uid));
+    const profile = profileSnap.exists() ? profileSnap.data() : null;
+
+    const hasRealAlias = profile?.alias && !profile.alias.startsWith("user_");
+    if (hasRealAlias) {
+      renderProfilePreview(profile);
+      showView("view-app");
+      const preferredTab = storedTab();
+
+      const tabToShow = preferredTab === "profile" ? "profile" : preferredTab;
+      showTab(tabToShow);
+      // Run tab-specific loads independently so any error never crashes auth routing
+      if (tabToShow === "discover") {
+        loadCandidates().catch((err) => console.warn("Discover load failed:", err));
+      } else if (tabToShow === "matches") {
+        loadMatches().catch((err) => console.warn("Matches load failed:", err));
+      }
+    } else {
+      prefillOnboarding(profile);
+      showView("view-onboarding");
+    }
+  } catch (err) {
+    console.error("Routing error:", err);
+    showView("view-onboarding");
+  } finally {
+    showLoading(false);
+  }
+}
+
+// ── Firestore helpers ─────────────────────────────────────────
+function pairKey(a, b) { return [a, b].sort().join("_"); }
+
+async function isPairInCooldown(uidA, uidB) {
+  if (!db) return false;
+  try {
+    const pairId = pairKey(uidA, uidB);
+    const snap = await getDoc(doc(db, "unmatchPairs", pairId));
+    if (!snap.exists()) return false;
+    const data = snap.data();
+    const expiresAtMs = Number(data.expiresAtMs || 0);
+    return expiresAtMs > Date.now();
+  } catch (_err) {
+    // Non-existent docs trigger permission-denied under strict rules — safe to ignore
     return false;
   }
-  return true;
 }
 
-function log(message, data) {
-  const line = data ? `${message} ${JSON.stringify(data)}` : message;
-  el.logs.textContent = `${new Date().toISOString()}  ${line}\n${el.logs.textContent}`;
+async function hasActiveMatch(uid) {
+  const docs = await fetchMatchesForUser(uid);
+  return docs.some((d) => d.data()?.state !== "unmatched");
 }
 
-function pairKey(uidA, uidB) {
-  return [uidA, uidB].sort().join("_");
+async function fetchMatchesForUser(uid) {
+  const [snapA, snapB] = await Promise.all([
+    getDocs(query(collection(db, "matches"), where("userA", "==", uid))),
+    getDocs(query(collection(db, "matches"), where("userB", "==", uid)))
+  ]);
+  return [...snapA.docs, ...snapB.docs];
+}
+
+async function setCurrentUserDiscoverability(discoverable) {
+  if (!currentUser || !db) return;
+  await setDoc(doc(db, "profiles", currentUser.uid), {
+    profileVisible: discoverable,
+    matchingState: discoverable ? "discoverable" : "matched",
+    updatedAt: serverTimestamp()
+  }, { merge: true });
 }
 
 async function ensureUserDocs(uid) {
-  const userRef = doc(db, "users", uid);
+  const userRef    = doc(db, "users",    uid);
   const profileRef = doc(db, "profiles", uid);
+  const [uSnap, pSnap] = await Promise.all([getDoc(userRef), getDoc(profileRef)]);
 
-  const [userSnap, profileSnap] = await Promise.all([getDoc(userRef), getDoc(profileRef)]);
-
-  if (!userSnap.exists()) {
+  if (!uSnap.exists()) {
     await setDoc(userRef, {
-      uid,
-      status: "active",
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp()
+      uid, status: "active",
+      createdAt: serverTimestamp(), updatedAt: serverTimestamp()
     });
-  } else {
-    await updateDoc(userRef, { updatedAt: serverTimestamp() });
   }
-
-  if (!profileSnap.exists()) {
+  if (!pSnap.exists()) {
+    // Use the role the user picked on the landing screen
+    const roleToSave = $('role').value || selectedRole || "aupair";
     await setDoc(profileRef, {
-      uid,
-      role: "aupair",
+      uid, role: roleToSave,
       alias: `user_${uid.slice(0, 6)}`,
-      region: "",
-      interests: [],
-      availability: "",
+      region: "", interests: [], availability: "",
+      countryOfOrigin: "", visaMonthsLeft: null,
       about: "",
-      profileVisible: true,
-      updatedAt: serverTimestamp()
+      profileVisible: true, updatedAt: serverTimestamp()
     });
   }
 }
 
-el.loginBtn.addEventListener("click", async () => {
-  try {
-    if (!(await requireFirebaseReady())) return;
-    if (useLocalEmulators) {
-      log("Google popup is disabled in local emulator mode. Use Local demo login.");
-      return;
-    }
-    await signInWithPopup(auth, provider);
-  } catch (err) {
-    log("Login failed", { message: err.message });
+// ── Profile helpers ───────────────────────────────────────────
+function prefillOnboarding(profile) {
+  // Determine role: prefer what the user selected on the landing, fall back to saved profile role.
+  // For a brand-new profile (auto-created by ensureUserDocs), selectedRole already matches
+  // the landing choice. For returning users editing their profile, use the saved role.
+  const role = profile?.alias && !profile.alias.startsWith("user_")
+    ? (profile.role || selectedRole)   // returning user — trust saved role
+    : selectedRole;                    // new user — trust landing choice
+
+  selectedRole    = role;
+  $("role").value = role;
+
+  $("alias").value         = profile?.alias?.startsWith("user_") ? "" : (profile?.alias || "");
+  $("region").value        = profile?.region || "";
+  $("availability").value  = profile?.availability || "";
+  $("interests").value     = Array.isArray(profile?.interests) ? profile.interests.join(", ") : "";
+  $("countryOfOrigin").value = profile?.countryOfOrigin || "";
+  $("visaMonths").value    = profile?.visaMonthsLeft != null ? String(profile.visaMonthsLeft) : "";
+  $("about").value         = profile?.about || "";
+  $("aboutCount").textContent = String(($("about").value || "").length);
+
+  const firstChar = ($("alias").value || profile?.alias || "?")[0].toUpperCase();
+  $("onboardAvatar").textContent = firstChar;
+
+  if (role === "host") {
+    $("onboardSub").textContent = "Tell potential au pairs about your family — anonymously.";
+    $("aboutLabel").textContent = "About your family";
+  } else {
+    $("onboardSub").textContent = "Tell us about yourself — nothing here reveals your real identity.";
+    $("aboutLabel").textContent = "About you";
   }
-});
 
-el.demoLoginBtn.addEventListener("click", async () => {
-  try {
-    if (!(await requireFirebaseReady())) return;
-    await signInAnonymously(auth);
-  } catch (err) {
-    log("Local demo login failed", { message: err.message });
-  }
-});
+  updateAupairFields(role);
+}
 
-el.logoutBtn.addEventListener("click", async () => {
-  if (!(await requireFirebaseReady())) return;
-  await signOut(auth);
-});
+function escHtml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
 
-el.profileForm.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  if (!currentUser) {
-    log("Sign in first");
+function renderProfilePreview(profile) {
+  const el = $("profilePreview");
+  if (!el || !profile) return;
+
+  const alias     = profile.alias || "Anonymous";
+  const roleLabel = profile.role === "host" ? "Host Family" : "Au Pair";
+  const tags      = (Array.isArray(profile.interests) ? profile.interests : [])
+    .map(t => `<span class="interest-tag">${escHtml(t)}</span>`).join("");
+  const isAupair  = profile.role !== "host";
+
+  el.innerHTML = `
+    <div class="profile-av">${escHtml(alias[0].toUpperCase())}</div>
+    <h4>${escHtml(alias)}</h4>
+    <span class="role-badge">${roleLabel}</span>
+    ${profile.region       ? `<p class="meta-line"><svg class="meta-icon" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M5.05 4.05a7 7 0 119.9 9.9L10 18.9l-4.95-4.95a7 7 0 010-9.9zM10 11a2 2 0 100-4 2 2 0 000 4z" clip-rule="evenodd"/></svg> ${escHtml(profile.region)}</p>` : ""}
+    ${profile.availability ? `<p class="meta-line"><svg class="meta-icon" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M6 2a1 1 0 00-1 1v1H4a2 2 0 00-2 2v10a2 2 0 002 2h12a2 2 0 002-2V6a2 2 0 00-2-2h-1V3a1 1 0 10-2 0v1H7V3a1 1 0 00-1-1zm0 5a1 1 0 000 2h8a1 1 0 100-2H6z" clip-rule="evenodd"/></svg> ${escHtml(profile.availability)}</p>` : ""}
+    ${profile.countryOfOrigin ? `<p class="meta-line"><svg class="meta-icon" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M3 6a3 3 0 013-3h10a1 1 0 01.8 1.6L14.25 8l2.55 3.4A1 1 0 0116 13H6a1 1 0 00-1 1v3a1 1 0 11-2 0V6z" clip-rule="evenodd"/></svg> From: ${escHtml(profile.countryOfOrigin)}</p>` : ""}
+    ${isAupair && profile.visaMonthsLeft != null ? `<p class="meta-line"><svg class="meta-icon" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M4 4a2 2 0 012-2h4.586A2 2 0 0112 2.586L15.414 6A2 2 0 0116 7.414V16a2 2 0 01-2 2H6a2 2 0 01-2-2V4zm2 6a1 1 0 011-1h6a1 1 0 110 2H7a1 1 0 01-1-1zm1 3a1 1 0 100 2h6a1 1 0 100-2H7z" clip-rule="evenodd"/></svg> ${escHtml(String(profile.visaMonthsLeft))} months on visa</p>` : ""}
+    ${tags ? `<div class="interest-tags" style="margin-top:10px">${tags}</div>` : ""}
+    ${profile.about ? `<p class="about-text">${escHtml(profile.about)}</p>` : ""}
+  `;
+}
+
+// ── Discover: load candidates ─────────────────────────────────
+async function loadCandidates() {
+  if (!currentUser || !db) return;
+
+  await updateLikeQuotaUI();
+
+  const mySnap = await getDoc(doc(db, "profiles", currentUser.uid));
+  if (!mySnap.exists()) return;
+
+  const mine       = mySnap.data();
+  const targetRole = mine.role === "aupair" ? "host" : "aupair";
+  const roleLabel  = targetRole === "host" ? "host families" : "au pairs";
+  $("discoverSub").textContent = `Showing ${roleLabel} near you`;
+
+  const snap = await getDocs(query(
+    collection(db, "profiles"),
+    where("role", "==", targetRole),
+    where("profileVisible", "==", true),
+    limit(50)
+  ));
+
+  const mineInterests = Array.isArray(mine.interests) ? mine.interests : [];
+  const candidates = [];
+
+  snap.forEach(d => {
+    if (d.id === currentUser.uid) return;
+    const p = d.data();
+    const theirInterests = Array.isArray(p.interests) ? p.interests : [];
+    const overlap = theirInterests.filter(x => mineInterests.includes(x)).length;
+    const sameRegion = (p.region || "").trim().toLowerCase() === (mine.region || "").trim().toLowerCase();
+    const score = (sameRegion ? 1000 : 0) + (overlap * 20);
+    candidates.push({
+      uid: d.id, alias: p.alias || "anonymous",
+      role: p.role, region: p.region || "",
+      interests: theirInterests, availability: p.availability || "",
+      countryOfOrigin: p.countryOfOrigin || "",
+      visaMonthsLeft: p.visaMonthsLeft ?? null,
+      about: p.about || "",
+      matched: p.matchingState === "matched" || p.hasMatch === true,
+      score,
+      sameRegion,
+      overlap
+    });
+  });
+
+  const candidatesWithCooldown = await Promise.all(candidates.map(async (candidate) => ({
+    ...candidate,
+    blockedByCooldown: await isPairInCooldown(currentUser.uid, candidate.uid)
+  })));
+
+  const visibleCandidates = candidatesWithCooldown.filter((candidate) => !candidate.blockedByCooldown);
+  visibleCandidates.sort((a, b) => b.score - a.score);
+
+  const grid = $("candidates");
+  grid.innerHTML = "";
+
+  if (visibleCandidates.length === 0) {
+    grid.innerHTML = `<p class="empty-state">No candidates available right now — check back later.</p>`;
+    $("loadCandidatesBtn").disabled = false;
+    $("loadCandidatesBtn").textContent = "Refresh";
     return;
   }
 
-  const interests = el.interests.value
-    .split(",")
-    .map((x) => x.trim())
-    .filter(Boolean)
-    .slice(0, 12);
+  visibleCandidates.forEach(c => {
+    const card = document.createElement("div");
+    card.className = "candidate-card";
+    const cRoleLabel = c.role === "host" ? "Host Family" : "Au Pair";
+    const tags = c.interests.map(t => `<span class="interest-tag">${escHtml(t)}</span>`).join("");
+
+    const visaLine = c.role === "aupair" && c.visaMonthsLeft != null
+      ? `<span><svg class="meta-icon" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M4 4a2 2 0 012-2h4.586A2 2 0 0112 2.586L15.414 6A2 2 0 0116 7.414V16a2 2 0 01-2 2H6a2 2 0 01-2-2V4zm2 6a1 1 0 011-1h6a1 1 0 110 2H7a1 1 0 01-1-1zm1 3a1 1 0 100 2h6a1 1 0 100-2H7z" clip-rule="evenodd"/></svg> ${escHtml(String(c.visaMonthsLeft))} mo. visa</span>` : "";
+    const countryLine = c.countryOfOrigin
+      ? `<span><svg class="meta-icon" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M3 6a3 3 0 013-3h10a1 1 0 01.8 1.6L14.25 8l2.55 3.4A1 1 0 0116 13H6a1 1 0 00-1 1v3a1 1 0 11-2 0V6z" clip-rule="evenodd"/></svg> ${escHtml(c.countryOfOrigin)}</span>` : "";
+
+    card.innerHTML = `
+      <div class="candidate-top">
+        <div class="candidate-avatar">${escHtml(c.alias[0].toUpperCase())}</div>
+        <div class="candidate-meta">
+          <strong>${escHtml(c.alias)} ${c.matched ? '<span class="candidate-match-badge">Matched</span>' : ''}</strong>
+          <div class="role-tag">${cRoleLabel}${countryLine ? " · " + countryLine : ""}${visaLine ? " · " + visaLine : ""}</div>
+        </div>
+      </div>
+      ${c.region ? `<div class="region-line">📍 ${escHtml(c.region)}${c.availability ? " · " + escHtml(c.availability) : ""}${c.sameRegion ? " · ⭐ same location" : ""}${c.overlap ? ` · ${c.overlap} shared interests` : ""}</div>` : ""}
+      ${c.about ? `<p class="candidate-about"><strong>About:</strong> ${escHtml(truncateText(c.about, 220))}</p>` : ""}
+      ${tags ? `<div class="interest-tags">${tags}</div>` : ""}
+      <div class="candidate-actions">
+        <button class="btn-like">💚 Like</button>
+        <button class="btn-pass">Pass</button>
+      </div>
+    `;
+
+    card.querySelector(".btn-like").addEventListener("click", () => likeCandidate(c.uid, c.alias, card));
+    card.querySelector(".btn-pass").addEventListener("click", () => passCandidate(c.uid, card));
+    grid.appendChild(card);
+  });
+}
+
+async function likeCandidate(targetUid, targetAlias, cardEl) {
+  if (!currentUser || !db) return;
+
+  const likeBtn = cardEl.querySelector(".btn-like");
+  likeBtn.disabled    = true;
+  likeBtn.textContent = "Liked ✓";
+
+  const actionId  = `${currentUser.uid}_${targetUid}`;
+  const reverseId = `${targetUid}_${currentUser.uid}`;
 
   try {
-    await setDoc(doc(db, "profiles", currentUser.uid), {
-      uid: currentUser.uid,
-      role: el.role.value === "host" ? "host" : "aupair",
-      alias: (el.alias.value || `user_${currentUser.uid.slice(0, 6)}`).trim().slice(0, 40),
-      region: (el.region.value || "").trim().slice(0, 64),
-      interests,
-      availability: (el.availability.value || "").trim().slice(0, 64),
-      about: (el.about.value || "").trim().slice(0, 300),
-      profileVisible: true,
-      updatedAt: serverTimestamp()
+    const currentActionSnap = await getDoc(doc(db, "matchActions", actionId));
+    const currentAction = currentActionSnap.exists() ? currentActionSnap.data().action : null;
+
+    if (currentAction !== "like") {
+      const likeCount = await getLikeCount(currentUser.uid);
+
+      if (likeCount >= 3) {
+        likeBtn.disabled = false;
+        likeBtn.textContent = "💚 Like";
+        toast("You can select up to 3 candidates. Pass or wait for a match.", "warning", 5500);
+        await updateLikeQuotaUI();
+        return;
+      }
+    }
+
+    await setDoc(doc(db, "matchActions", actionId), {
+      actorUid: currentUser.uid, targetUid, action: "like",
+      createdAt: serverTimestamp()
     }, { merge: true });
 
-    log("Profile saved", { ok: true });
-  } catch (err) {
-    log("Profile save failed", { message: err.message });
-  }
-});
+    const reverse = await getDoc(doc(db, "matchActions", reverseId));
+    const mutual  = reverse.exists() && reverse.data().action === "like";
 
-el.loadCandidatesBtn.addEventListener("click", async () => {
-  if (!currentUser) {
-    log("Sign in first");
-    return;
-  }
+    if (mutual) {
+      const matchId = pairKey(currentUser.uid, targetUid);
+      const sorted  = [currentUser.uid, targetUid].sort();
 
-  try {
-    const mySnap = await getDoc(doc(db, "profiles", currentUser.uid));
-    if (!mySnap.exists()) {
-      log("Complete profile first");
-      return;
-    }
+      await setDoc(doc(db, "matches", matchId), {
+        matchId, userA: sorted[0], userB: sorted[1],
+        state: "mutual_match", revealA: false, revealB: false,
+        createdAt: serverTimestamp(), updatedAt: serverTimestamp()
+      }, { merge: true });
 
-    const mine = mySnap.data();
-    const targetRole = mine.role === "aupair" ? "host" : "aupair";
-    const requestedRegion = el.region.value.trim() || mine.region || "";
+      await setDoc(doc(db, "threads", matchId), {
+        threadId: matchId, userA: sorted[0], userB: sorted[1],
+        messageCount: 0, createdAt: serverTimestamp(), updatedAt: serverTimestamp()
+      }, { merge: true });
 
-    let candidatesQuery = query(
-      collection(db, "profiles"),
-      where("role", "==", targetRole),
-      where("profileVisible", "==", true),
-      limit(50)
-    );
+      await setDoc(doc(db, "profiles", currentUser.uid), {
+        hasMatch: true,
+        matchingState: "matched",
+        profileVisible: true,
+        updatedAt: serverTimestamp()
+      }, { merge: true });
 
-    if (requestedRegion) {
-      candidatesQuery = query(
-        collection(db, "profiles"),
-        where("role", "==", targetRole),
-        where("profileVisible", "==", true),
-        where("region", "==", requestedRegion),
-        limit(50)
-      );
-    }
-
-    const snap = await getDocs(candidatesQuery);
-    const mineInterests = Array.isArray(mine.interests) ? mine.interests : [];
-
-    const candidates = [];
-    snap.forEach((candidateDoc) => {
-      if (candidateDoc.id === currentUser.uid) return;
-      const p = candidateDoc.data();
-      const theirInterests = Array.isArray(p.interests) ? p.interests : [];
-      const overlap = theirInterests.filter((x) => mineInterests.includes(x)).length;
-      const score = overlap * 10 + ((p.region || "") === (mine.region || "") ? 30 : 0);
-
-      candidates.push({
-        uid: candidateDoc.id,
-        alias: p.alias || "anonymous",
-        role: p.role,
-        region: p.region || "",
-        interests: theirInterests,
-        score
-      });
-    });
-
-    candidates.sort((a, b) => b.score - a.score);
-    el.candidates.innerHTML = "";
-
-    candidates.forEach((candidate) => {
-      const wrap = document.createElement("div");
-      wrap.className = "candidate";
-      wrap.innerHTML = `
-        <strong>${candidate.alias}</strong><br>
-        role: ${candidate.role}<br>
-        region: ${candidate.region}<br>
-        interests: ${(candidate.interests || []).join(", ")}<br>
-        score: ${candidate.score}
+      cardEl.innerHTML = `
+        <div class="match-burst">
+          <div class="match-emoji">💚</div>
+          <strong>It's a match with ${escHtml(targetAlias)}!</strong>
+          <p>Go to the Matches tab to start chatting.</p>
+        </div>
       `;
 
-      const actions = document.createElement("div");
-      actions.className = "actions";
+      await updateLikeQuotaUI();
+      toast("Mutual match created. You can continue discovering or open Matches.", "success", 5000);
+    } else {
+      cardEl.style.opacity = "0.5";
+      await updateLikeQuotaUI();
+    }
+  } catch (err) {
+    console.error("Like failed:", err);
+    likeBtn.disabled    = false;
+    likeBtn.textContent = "💚 Like";
+  }
+}
 
-      const likeBtn = document.createElement("button");
-      likeBtn.textContent = "Like";
-      likeBtn.addEventListener("click", async () => {
-        try {
-          const actionId = `${currentUser.uid}_${candidate.uid}`;
-          const reverseId = `${candidate.uid}_${currentUser.uid}`;
+async function passCandidate(targetUid, cardEl) {
+  if (!currentUser || !db) return;
+  try {
+    await setDoc(doc(db, "matchActions", `${currentUser.uid}_${targetUid}`), {
+      actorUid: currentUser.uid, targetUid, action: "pass",
+      createdAt: serverTimestamp()
+    }, { merge: true });
+    await updateLikeQuotaUI();
+    cardEl.style.display = "none";
+  } catch (err) {
+    console.error("Pass failed:", err);
+  }
+}
 
-          await setDoc(doc(db, "matchActions", actionId), {
-            actorUid: currentUser.uid,
-            targetUid: candidate.uid,
-            action: "like",
-            createdAt: serverTimestamp()
-          }, { merge: true });
+// ── Matches & Chat ────────────────────────────────────────────
+async function loadMatches() {
+  if (!currentUser || !db) return;
 
-          const reverse = await getDoc(doc(db, "matchActions", reverseId));
-          const mutual = reverse.exists() && reverse.data().action === "like";
+  const resumeMatchId = storedMatchId();
+  let resumeMatchData = null;
 
-          if (!mutual) {
-            log("likeCandidate", { mutual: false });
-            return;
-          }
+  const [snapA, snapB] = await Promise.all([
+    getDocs(query(collection(db, "matches"), where("userA", "==", currentUser.uid))),
+    getDocs(query(collection(db, "matches"), where("userB", "==", currentUser.uid)))
+  ]);
 
-          const matchId = pairKey(currentUser.uid, candidate.uid);
-          const sorted = [currentUser.uid, candidate.uid].sort();
+  const matchDocs = [...snapA.docs, ...snapB.docs];
+  const list = $("matchesList");
 
-          await setDoc(doc(db, "matches", matchId), {
-            matchId,
-            userA: sorted[0],
-            userB: sorted[1],
-            state: "mutual_match",
-            revealA: false,
-            revealB: false,
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp()
-          }, { merge: true });
+  if (matchDocs.length === 0) {
+    list.innerHTML = `<p class="empty-state">No matches yet — start discovering!</p>`;
+    return;
+  }
 
-          await setDoc(doc(db, "threads", matchId), {
-            threadId: matchId,
-            userA: sorted[0],
-            userB: sorted[1],
-            messageCount: 0,
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp()
-          }, { merge: true });
+  list.innerHTML = "";
 
-          el.threadId.value = matchId;
-          log("likeCandidate", { mutual: true, matchId });
-        } catch (err) {
-          log("likeCandidate failed", { message: err.message });
-        }
-      });
+  for (const matchDoc of matchDocs) {
+    const m        = matchDoc.data();
+    const otherUid = m.userA === currentUser.uid ? m.userB : m.userA;
 
-      const passBtn = document.createElement("button");
-      passBtn.className = "secondary";
-      passBtn.textContent = "Pass";
-      passBtn.addEventListener("click", async () => {
-        try {
-          await setDoc(doc(db, "matchActions", `${currentUser.uid}_${candidate.uid}`), {
-            actorUid: currentUser.uid,
-            targetUid: candidate.uid,
-            action: "pass",
-            createdAt: serverTimestamp()
-          }, { merge: true });
-          log("passCandidate", { ok: true });
-        } catch (err) {
-          log("passCandidate failed", { message: err.message });
-        }
-      });
+    const otherSnap = await getDoc(doc(db, "profiles", otherUid));
+    const other     = otherSnap.exists() ? otherSnap.data() : { alias: "Anonymous", role: "aupair" };
 
-      actions.appendChild(likeBtn);
-      actions.appendChild(passBtn);
-      wrap.appendChild(actions);
-      el.candidates.appendChild(wrap);
+    const item = document.createElement("div");
+    item.className = "match-item";
+
+    const cRoleLabel = other.role === "host" ? "Host Family" : "Au Pair";
+    const stateLabel = m.state === "unmatched"
+      ? "Match closed"
+      : (m.state === "revealed" ? "Identity revealed" : "Anonymous chat");
+    const aboutPreview = truncateText(other.about || "", 120);
+
+    item.innerHTML = `
+      <div class="match-avatar">${escHtml((other.alias || "A")[0].toUpperCase())}</div>
+      <div class="match-info">
+        <strong>${escHtml(other.alias || "Anonymous")}</strong>
+        <small>${cRoleLabel} · ${stateLabel}</small>
+        ${aboutPreview ? `<p class="match-about">${escHtml(aboutPreview)}</p>` : ""}
+      </div>
+      <span class="match-chevron">${m.state === "unmatched" ? "🔒" : "›"}</span>
+    `;
+
+    if (m.state === "unmatched") {
+      item.classList.add("closed");
+    }
+
+    item.addEventListener("click", () => openChat(m.matchId, other, m.state || "mutual_match"));
+    list.appendChild(item);
+
+    if (m.matchId === resumeMatchId) {
+      resumeMatchData = { matchId: m.matchId, other, state: m.state || "mutual_match" };
+    }
+  }
+
+  if (resumeMatchData) {
+    openChat(resumeMatchData.matchId, resumeMatchData.other, resumeMatchData.state);
+  }
+}
+
+function setChatComposerEnabled(enabled, placeholder = "Type a message…") {
+  const textEl = $("messageText");
+  const sendEl = $("sendMessageBtn");
+  if (!textEl || !sendEl) return;
+  textEl.disabled = !enabled;
+  sendEl.disabled = !enabled;
+  textEl.placeholder = placeholder;
+}
+
+async function openChat(matchId, otherProfile, matchState = "mutual_match") {
+  const isClosed = matchState === "unmatched";
+
+  // First-time chat: show community guidelines gate
+  if (!isClosed && !hasChatRulesAccepted()) {
+    const accepted = await showChatRulesModal();
+    if (!accepted) return;
+  }
+
+  const alias = typeof otherProfile === "string"
+    ? otherProfile
+    : (otherProfile?.alias || "Anonymous");
+  const roleLabel = (typeof otherProfile === "object" && otherProfile?.role === "host")
+    ? "Host Family"
+    : "Au Pair";
+  const aboutPreview = typeof otherProfile === "object"
+    ? truncateText(otherProfile?.about || "", 160)
+    : "";
+
+  currentMatchId = matchId;
+  currentMatchState = matchState;
+  setStoredMatchId(matchId);
+  $("chatMatchHeader").innerHTML = `
+    <strong>Chat with ${escHtml(alias)}${isClosed ? ' <span class="chat-header-closed">· Closed</span>' : ""}</strong>
+    <div class="chat-match-sub">${escHtml(roleLabel)}${aboutPreview ? " · " + escHtml(aboutPreview) : ""}</div>
+  `;
+  $("matchesList").style.display   = "none";
+  $("chatPanel").classList.remove("hidden");
+  $("view-app").classList.add("chat-open");
+
+  if (isClosed) {
+    $("chatClosedBanner").classList.remove("hidden");
+    $("chatActions").classList.add("hidden");
+    setChatComposerEnabled(false, "This chat is closed.");
+  } else {
+    $("chatClosedBanner").classList.add("hidden");
+    $("chatActions").classList.remove("hidden");
+    setChatComposerEnabled(true, "Type a message…");
+  }
+  setChatStatus("");
+  resizeMessageInput();
+  loadMessages(matchId);
+}
+
+function setChatStatus(text, tone = "info") {
+  const el = $("chatStatus");
+  if (!el) return;
+  el.textContent = text;
+  el.className = `chat-status ${tone}`;
+}
+
+function resizeMessageInput() {
+  const input = $("messageText");
+  if (!input) return;
+
+  const maxPx = 96;
+  input.style.height = "auto";
+  const nextHeight = Math.min(input.scrollHeight, maxPx);
+  input.style.height = `${nextHeight}px`;
+  input.style.overflowY = input.scrollHeight > maxPx ? "auto" : "hidden";
+}
+
+async function loadMessages(matchId) {
+  if (!currentUser || !db) return;
+
+  try {
+    // Rules allow reads only when auth uid is in participants, so query by that first.
+    const snap = await getDocs(
+      query(
+        collection(db, "messages"),
+        where("participants", "array-contains", currentUser.uid),
+        limit(300)
+      )
+    );
+
+    const msgs = [];
+    snap.forEach(d => {
+      const data = d.data();
+      if (data.threadId === matchId) {
+        msgs.push({ id: d.id, ...data });
+      }
+    });
+    msgs.sort((a, b) => (a.createdAt?.seconds || 0) - (b.createdAt?.seconds || 0));
+
+    const container = $("chatMessages");
+    container.innerHTML = "";
+
+    if (msgs.length === 0) {
+      container.innerHTML = `<p class="empty-state" style="padding:16px 0">No messages yet — say hello!</p>`;
+      return;
+    }
+
+    msgs.forEach(msg => {
+      const div = document.createElement("div");
+      div.className = `chat-msg ${msg.senderUid === currentUser.uid ? "mine" : "theirs"}`;
+      div.textContent = msg.text || "";
+      container.appendChild(div);
     });
 
-    log("Candidates loaded", { count: candidates.length });
+    container.scrollTop = container.scrollHeight;
   } catch (err) {
-    log("Failed to load candidates", { message: err.message });
+    console.error("Load messages failed:", err);
+    setChatStatus("Could not load chat messages. Please try again.", "error");
+    toast("Could not load chat messages.", "error", 4500);
   }
-});
+}
 
-el.revealBtn.addEventListener("click", async () => {
-  if (!currentUser) {
-    log("Sign in first");
-    return;
-  }
+async function sendMessage(matchId, text) {
+  if (!currentUser || !db || !text.trim()) return;
 
-  const matchId = el.threadId.value.trim();
-  if (!matchId) {
-    log("Enter match id in thread field");
-    return;
+  if (currentMatchState === "unmatched") {
+    throw new Error("This chat is closed because the match was removed.");
   }
 
-  try {
-    const matchRef = doc(db, "matches", matchId);
-    const matchSnap = await getDoc(matchRef);
+  const matchSnap = await getDoc(doc(db, "matches", matchId));
+  if (!matchSnap.exists()) {
+    throw new Error("Match no longer exists");
+  }
+  const matchData = matchSnap.data();
+  if (matchData.state === "unmatched") {
+    currentMatchState = "unmatched";
+    setChatComposerEnabled(false, "This chat is closed after unmatch.");
+    throw new Error("This chat is closed because the match was removed.");
+  }
 
-    if (!matchSnap.exists()) {
-      log("Match not found");
+  const threadSnap = await getDoc(doc(db, "threads", matchId));
+  if (!threadSnap.exists()) {
+    throw new Error("Thread not found");
+  }
+
+  const thread = threadSnap.data();
+  const participants = [thread.userA, thread.userB].filter(Boolean);
+  if (!participants.includes(currentUser.uid)) {
+    throw new Error("You are not part of this conversation");
+  }
+
+  await addDoc(collection(db, "messages"), {
+    threadId:  matchId,
+    participants,
+    senderUid: currentUser.uid,
+    text:      text.trim().slice(0, 2000),
+    createdAt: serverTimestamp()
+  });
+
+  await updateDoc(doc(db, "threads", matchId), {
+    messageCount:  increment(1),
+    lastMessageAt: serverTimestamp(),
+    updatedAt:     serverTimestamp()
+  });
+}
+
+// ── Close match / Report ──────────────────────────────────────
+
+function showReportModal() {
+  return new Promise((resolve) => {
+    const modal   = $("reportModal");
+    if (!modal) {
+      resolve(null);
       return;
     }
+    const confirm = $("reportModalConfirm");
+    const cancel  = $("reportModalCancel");
+    const radios  = modal.querySelectorAll("input[name='reportReason']");
 
-    const matchData = matchSnap.data();
-    if (matchData.userA !== currentUser.uid && matchData.userB !== currentUser.uid) {
-      log("Not part of this match");
+    // Reset state
+    radios.forEach(r => { r.checked = false; });
+    confirm.disabled = true;
+
+    const onChange = () => { confirm.disabled = !modal.querySelector("input[name='reportReason']:checked"); };
+    radios.forEach(r => r.addEventListener("change", onChange));
+
+    const cleanup = (result) => {
+      radios.forEach(r => r.removeEventListener("change", onChange));
+      modal.classList.remove("active");
+      modal.hidden = true;
+      modal.setAttribute("aria-hidden", "true");
+      resolve(result);
+    };
+
+    confirm.onclick = () => {
+      const checked = modal.querySelector("input[name='reportReason']:checked");
+      cleanup(checked ? checked.value : null);
+    };
+    cancel.onclick = () => cleanup(null);
+
+    modal.classList.add("active");
+    modal.hidden = false;
+    modal.setAttribute("aria-hidden", "false");
+  });
+}
+
+function showFeedbackModal() {
+  return new Promise((resolve) => {
+    const modal = $("feedbackModal");
+    if (!modal) {
+      resolve(null);
       return;
     }
+    const textEl = $("feedbackText");
+    const countEl = $("feedbackCount");
+    const confirm = $("feedbackModalConfirm");
+    const cancel = $("feedbackModalCancel");
 
-    const patch = { updatedAt: serverTimestamp() };
-    if (matchData.userA === currentUser.uid) patch.revealA = true;
-    if (matchData.userB === currentUser.uid) patch.revealB = true;
+    const updateState = () => {
+      const text = (textEl.value || "").trim();
+      countEl.textContent = String(textEl.value.length);
+      confirm.disabled = text.length < 10;
+    };
 
-    await updateDoc(matchRef, patch);
+    textEl.value = "";
+    countEl.textContent = "0";
+    confirm.disabled = true;
+    textEl.addEventListener("input", updateState);
 
-    const updatedSnap = await getDoc(matchRef);
-    const updated = updatedSnap.data();
+    const cleanup = (result) => {
+      textEl.removeEventListener("input", updateState);
+      modal.classList.remove("active");
+      modal.hidden = true;
+      modal.setAttribute("aria-hidden", "true");
+      resolve(result);
+    };
 
-    if (updated.revealA && updated.revealB && updated.state !== "revealed") {
-      await updateDoc(matchRef, { state: "revealed", updatedAt: serverTimestamp() });
-    }
+    confirm.onclick = () => cleanup((textEl.value || "").trim());
+    cancel.onclick = () => cleanup(null);
 
-    await setDoc(doc(db, "revealConsents", `${matchId}_${currentUser.uid}`), {
-      matchId,
-      uid: currentUser.uid,
-      participants: [updated.userA, updated.userB],
-      consentedAt: serverTimestamp()
-    }, { merge: true });
+    modal.classList.add("active");
+    modal.hidden = false;
+    modal.setAttribute("aria-hidden", "false");
+    textEl.focus();
+  });
+}
 
-    log("setRevealConsent", { ok: true });
-  } catch (err) {
-    log("Reveal failed", { message: err.message });
-  }
-});
+async function sendFeedback() {
+  if (!currentUser || !db) return;
+  const feedbackText = await showFeedbackModal();
+  if (!feedbackText) return;
 
-el.sendMessageBtn.addEventListener("click", async () => {
-  if (!currentUser) {
-    log("Sign in first");
+  await addDoc(collection(db, "feedbackMessages"), {
+    uid: currentUser.uid,
+    email: currentUser.email || null,
+    text: feedbackText.slice(0, 600),
+    status: "todo",
+    createdAt: serverTimestamp()
+  });
+
+  toast("Thanks for your feedback. Admin has received it.", "success", 4500);
+}
+
+async function closeCurrentMatch(closeReason = "not_a_fit") {
+  if (!currentUser || !db || !currentMatchId) return;
+
+  const isReport = closeReason !== "not_a_fit";
+  const confirmText = isReport
+    ? "This will close the chat and submit your safety report to the admin team."
+    : "End this match? The chat will close for both of you.";
+  const confirmLabel = isReport ? "Submit report & close" : "End match";
+
+  const ok = await showConfirm(confirmText, confirmLabel, true);
+  if (!ok) return;
+
+  const matchRef  = doc(db, "matches", currentMatchId);
+  const matchSnap = await getDoc(matchRef);
+  if (!matchSnap.exists()) {
+    toast("This match was already removed.", "warning", 4500);
     return;
   }
 
-  const threadId = el.threadId.value.trim();
-  const text = el.messageText.value.trim();
-
-  if (!threadId) {
-    log("Enter thread id");
+  const matchData = matchSnap.data();
+  if (matchData.userA !== currentUser.uid && matchData.userB !== currentUser.uid) {
+    toast("You are not allowed to close this conversation.", "error", 4500);
+    return;
+  }
+  if (matchData.state === "unmatched") {
+    currentMatchState = "unmatched";
+    setChatComposerEnabled(false, "This chat is already closed.");
+    setCloseButtonsDisabled(true);
+    setChatStatus("This match was already closed.", "info");
     return;
   }
 
-  if (!text) {
-    log("Type a message first");
-    return;
+  const otherUid   = matchData.userA === currentUser.uid ? matchData.userB : matchData.userA;
+  const cooldownMs = UNMATCH_COOLDOWN_DAYS * 24 * 60 * 60 * 1000;
+
+  await updateDoc(matchRef, {
+    state: "unmatched",
+    closedBy: currentUser.uid,
+    closeReason,
+    closedAt: serverTimestamp(),
+    updatedAt: serverTimestamp()
+  });
+
+  await setDoc(doc(db, "unmatchPairs", pairKey(currentUser.uid, otherUid)), {
+    pairId: pairKey(currentUser.uid, otherUid),
+    userA: [currentUser.uid, otherUid].sort()[0],
+    userB: [currentUser.uid, otherUid].sort()[1],
+    closedBy: currentUser.uid,
+    createdAt: serverTimestamp(),
+    expiresAtMs: Date.now() + cooldownMs
+  }, { merge: true });
+
+  // Closing a match should free this slot from the "Selected" quota.
+  await setDoc(doc(db, "matchActions", `${currentUser.uid}_${otherUid}`), {
+    actorUid: currentUser.uid,
+    targetUid: otherUid,
+    action: "pass",
+    createdAt: serverTimestamp()
+  }, { merge: true });
+
+  if (isReport) {
+    await addDoc(collection(db, "abuseReports"), {
+      reporterUid: currentUser.uid,
+      reportedUid: otherUid,
+      matchId: currentMatchId,
+      reason: closeReason,
+      status: "pending",
+      createdAt: serverTimestamp()
+    });
   }
+
+  const active = await hasActiveMatch(currentUser.uid);
+  await setDoc(doc(db, "profiles", currentUser.uid), {
+    hasMatch: active,
+    matchingState: active ? "matched" : "discoverable",
+    profileVisible: true,
+    updatedAt: serverTimestamp()
+  }, { merge: true });
+
+  currentMatchState = "unmatched";
+  setChatComposerEnabled(false, "This chat is now closed.");
+  setCloseButtonsDisabled(true);
+  $("revealBtn").disabled = true;
+
+  if (isReport) {
+    setChatStatus("Report submitted. Thank you — the chat is now closed.", "info");
+    toast("Safety report submitted and chat closed.", "success", 5000);
+  } else {
+    setChatStatus("You ended this match. Chat is now closed.", "info");
+    toast("Match ended. You can continue discovering others.", "success", 5000);
+  }
+
+  await Promise.all([loadMatches(), loadCandidates(), updateLikeQuotaUI()]);
+}
+
+function setCloseButtonsDisabled(disabled) {
+  const btn1 = $("closeMatchBtn");
+  const btn2 = $("reportCloseBtn");
+  if (btn1) btn1.disabled = disabled;
+  if (btn2) btn2.disabled = disabled;
+}
+
+async function revealConsent(matchId) {
+  if (!currentUser || !db) return;
+
+  const matchRef  = doc(db, "matches", matchId);
+  const matchSnap = await getDoc(matchRef);
+  if (!matchSnap.exists()) return;
+
+  const m = matchSnap.data();
+  if (m.userA !== currentUser.uid && m.userB !== currentUser.uid) return;
+
+  const patch = { updatedAt: serverTimestamp() };
+  if (m.userA === currentUser.uid) patch.revealA = true;
+  else                              patch.revealB = true;
+
+  await updateDoc(matchRef, patch);
+
+  const updated = (await getDoc(matchRef)).data();
+  if (updated.revealA && updated.revealB && updated.state !== "revealed") {
+    await updateDoc(matchRef, { state: "revealed", updatedAt: serverTimestamp() });
+    setChatStatus("Both of you consented. You can now share contact details.", "success");
+    toast("Both of you consented! You can now share contact details in chat.", "success", 6000);
+  } else {
+    setChatStatus("Consent saved. Waiting for the other person.", "info");
+    toast("Your consent to reveal has been recorded. Waiting for the other person.", "info", 5000);
+  }
+}
+
+async function requestDelete() {
+  if (!currentUser || !db) return;
+  const ok = await showConfirm(
+    "This will hide your profile and queue all your data for deletion. This cannot be undone.",
+    "Delete my data",
+    true
+  );
+  if (!ok) return;
+
+  await setDoc(doc(db, "deletionQueue", currentUser.uid), {
+    uid: currentUser.uid, status: "pending",
+    requestedAt: serverTimestamp()
+  });
+
+  await updateDoc(doc(db, "profiles", currentUser.uid), {
+    profileVisible: false, updatedAt: serverTimestamp()
+  });
+
+  toast("Deletion request submitted. Your profile is now hidden.", "info", 5000);
+  await signOut(auth);
+}
+
+// ── Admin Dashboard ───────────────────────────────────────────
+
+async function loadAdminDashboard() {
+  $("adminStatus").textContent = "";
+  $("adminLastRefresh").textContent = "Loading…";
 
   try {
-    const [threadSnap, matchSnap] = await Promise.all([
-      getDoc(doc(db, "threads", threadId)),
-      getDoc(doc(db, "matches", threadId))
+    const [profileSnap, matchSnap, deletionSnap, cooldownSnap, abuseSnap, feedbackSnap] = await Promise.all([
+      getDocs(collection(db, "profiles")),
+      getDocs(collection(db, "matches")),
+      getDocs(collection(db, "deletionQueue")),
+      getDocs(collection(db, "unmatchPairs")),
+      getDocs(collection(db, "abuseReports")),
+      getDocs(collection(db, "feedbackMessages")),
     ]);
 
-    if (!threadSnap.exists() || !matchSnap.exists()) {
-      log("Thread or match not found");
-      return;
-    }
-
-    const thread = threadSnap.data();
-    const matchData = matchSnap.data();
-
-    if (thread.userA !== currentUser.uid && thread.userB !== currentUser.uid) {
-      log("Not part of this thread");
-      return;
-    }
-
-    if (matchData.state !== "revealed") {
-      log("Identity reveal is required before chat");
-      return;
-    }
-
-    const participants = [thread.userA, thread.userB];
-
-    await addDoc(collection(db, "messages"), {
-      threadId,
-      participants,
-      senderUid: currentUser.uid,
-      text: text.slice(0, 2000),
-      createdAt: serverTimestamp(),
-      purgeAt: Date.now() + (1000 * 60 * 60 * 24 * 30)
+    let aupairs = 0, hosts = 0, visible = 0;
+    profileSnap.forEach(d => {
+      const p = d.data();
+      if (p.role === "aupair") aupairs++; else hosts++;
+      if (p.profileVisible) visible++;
     });
 
-    await updateDoc(doc(db, "threads", threadId), {
-      messageCount: increment(1),
-      lastMessageAt: serverTimestamp(),
-      updatedAt: serverTimestamp()
+    let activeMatches = 0, closedMatches = 0;
+    matchSnap.forEach(d => {
+      if (d.data().state === "unmatched") closedMatches++; else activeMatches++;
     });
 
-    el.messageText.value = "";
-    log("sendMessage", { ok: true });
+    const now = Date.now();
+    let expiredCooldowns = 0;
+    cooldownSnap.forEach(d => {
+      if (Number(d.data().expiresAtMs || 0) < now) expiredCooldowns++;
+    });
+
+    const deletionPending = [];
+    deletionSnap.forEach(d => {
+      if (d.data().status === "pending") deletionPending.push({ id: d.id, ...d.data() });
+    });
+
+    const abusePending = [];
+    abuseSnap.forEach(d => {
+      const data = d.data();
+      if (data.status === "pending") abusePending.push({ id: d.id, ...data });
+    });
+
+    const feedbackItems = [];
+    let feedbackTodo = 0;
+    let feedbackDoing = 0;
+    let feedbackDone = 0;
+    feedbackSnap.forEach(d => {
+      const data = d.data();
+      const status = data.status || "todo";
+      feedbackItems.push({ id: d.id, ...data, status });
+      if (status === "todo") feedbackTodo += 1;
+      else if (status === "doing") feedbackDoing += 1;
+      else if (status === "done") feedbackDone += 1;
+    });
+
+    feedbackItems.sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
+
+    $("adminStatUsers").textContent     = String(profileSnap.size);
+    $("adminStatAupairs").textContent   = String(aupairs);
+    $("adminStatHosts").textContent     = String(hosts);
+    $("adminStatVisible").textContent   = String(visible);
+    $("adminStatMatches").textContent   = String(matchSnap.size);
+    $("adminStatActive").textContent    = String(activeMatches);
+    $("adminStatClosed").textContent    = String(closedMatches);
+    $("adminStatDeletions").textContent = String(deletionPending.length);
+    $("adminStatAbuse").textContent     = String(abusePending.length);
+    $("adminStatFeedback").textContent  = String(feedbackItems.length);
+    $("adminFeedbackTodoCount").textContent = String(feedbackTodo);
+    $("adminFeedbackDoingCount").textContent = String(feedbackDoing);
+    $("adminFeedbackDoneCount").textContent = String(feedbackDone);
+    $("adminExpiredCooldownCount").textContent = String(expiredCooldowns);
+
+    const purgeBtn = $("adminPurgeCooldownsBtn");
+    if (purgeBtn) purgeBtn.disabled = expiredCooldowns === 0;
+
+    renderAdminDeletionQueue(deletionPending);
+    renderAdminAbuseReports(abusePending);
+    renderAdminFeedback(feedbackItems);
+
+    $("adminLastRefresh").textContent = `Last refreshed: ${new Date().toLocaleTimeString()}`;
   } catch (err) {
-    log("Message failed", { message: err.message });
+    console.error("Admin dashboard load failed:", err);
+    $("adminStatus").textContent = "Failed to load dashboard data. Check the console for details.";
+    $("adminLastRefresh").textContent = "Failed";
   }
-});
+}
 
-el.requestDeleteBtn.addEventListener("click", async () => {
-  if (!currentUser) {
-    log("Sign in first");
+function fmtTs(ts) {
+  if (!ts) return "—";
+  const ms = ts?.seconds ? ts.seconds * 1000 : Number(ts);
+  return new Date(ms).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+}
+
+function renderAdminDeletionQueue(items) {
+  const container = $("adminDeletionList");
+  if (!container) return;
+  if (items.length === 0) {
+    container.innerHTML = `<p class="empty-state">No pending deletion requests.</p>`;
     return;
   }
+  container.innerHTML = items.map(item => `
+    <div class="admin-deletion-item" id="del-item-${escHtml(item.id)}">
+      <div class="admin-deletion-meta">
+        <code class="admin-uid">${escHtml(item.id)}</code>
+        <span class="admin-del-date">Requested ${fmtTs(item.requestedAt)}</span>
+      </div>
+      <button class="btn-danger btn-sm" data-action="process-deletion" data-uid="${escHtml(item.id)}">
+        Hide + Mark done
+      </button>
+    </div>
+  `).join("");
+}
 
+const ABUSE_REASON_LABELS = {
+  inappropriate: "Inappropriate or offensive messages",
+  harassment:    "Harassment or threatening behaviour",
+  fake_profile:  "Fake or misleading profile",
+  other:         "Other safety concern",
+};
+
+function renderAdminAbuseReports(items) {
+  const container = $("adminAbuseList");
+  if (!container) return;
+  if (items.length === 0) {
+    container.innerHTML = `<p class="empty-state">No pending safety reports.</p>`;
+    return;
+  }
+  container.innerHTML = items.map(item => `
+    <div class="admin-deletion-item" id="abuse-item-${escHtml(item.id)}">
+      <div class="admin-deletion-meta">
+        <strong class="abuse-reason-label">${escHtml(ABUSE_REASON_LABELS[item.reason] || item.reason)}</strong>
+        <span class="admin-del-date">Match: <code class="admin-uid">${escHtml(item.matchId || "—")}</code></span>
+        <span class="admin-del-date">Reported ${fmtTs(item.createdAt)}</span>
+      </div>
+      <button class="btn-secondary btn-sm" data-action="review-report" data-id="${escHtml(item.id)}">
+        Mark reviewed
+      </button>
+    </div>
+  `).join("");
+}
+
+function renderAdminFeedback(items) {
+  const container = $("adminFeedbackList");
+  if (!container) return;
+  if (items.length === 0) {
+    container.innerHTML = `<p class="empty-state">No user feedback yet.</p>`;
+    return;
+  }
+  container.innerHTML = items.map(item => `
+    <div class="admin-deletion-item" id="feedback-item-${escHtml(item.id)}">
+      <div class="admin-deletion-meta">
+        <strong class="abuse-reason-label">${escHtml((item.text || "").slice(0, 220))}</strong>
+        <span class="admin-del-date">From UID: <code class="admin-uid">${escHtml(item.uid || "—")}</code></span>
+        <span class="admin-del-date">Submitted ${fmtTs(item.createdAt)} · Status: <span class="feedback-status ${escHtml(item.status)}">${escHtml(item.status)}</span></span>
+      </div>
+      <div class="feedback-actions">
+        <button class="btn-secondary btn-sm" data-action="set-feedback-status" data-id="${escHtml(item.id)}" data-status="todo" ${item.status === "todo" ? "disabled" : ""}>To do</button>
+        <button class="btn-secondary btn-sm" data-action="set-feedback-status" data-id="${escHtml(item.id)}" data-status="doing" ${item.status === "doing" ? "disabled" : ""}>Doing</button>
+        <button class="btn-secondary btn-sm" data-action="set-feedback-status" data-id="${escHtml(item.id)}" data-status="done" ${item.status === "done" ? "disabled" : ""}>Done</button>
+      </div>
+    </div>
+  `).join("");
+}
+
+async function markReportReviewed(reportId) {
   try {
-    await setDoc(doc(db, "deletionQueue", currentUser.uid), {
-      uid: currentUser.uid,
-      status: "pending",
-      requestedAt: serverTimestamp()
+    await setDoc(doc(db, "abuseReports", reportId), { status: "reviewed", reviewedAt: serverTimestamp() }, { merge: true });
+    const el = $(`abuse-item-${reportId}`);
+    if (el) el.remove();
+    const stat = $("adminStatAbuse");
+    if (stat) stat.textContent = String(Math.max(0, Number(stat.textContent) - 1));
+    toast("Report marked as reviewed.", "success", 3000);
+  } catch (err) {
+    console.error("markReportReviewed error:", err);
+    toast("Failed: " + (err.message || "unknown error"), "error", 5000);
+  }
+}
+
+async function setFeedbackStatus(feedbackId, status) {
+  if (!["todo", "doing", "done"].includes(status)) return;
+  try {
+    await setDoc(doc(db, "feedbackMessages", feedbackId), {
+      status,
+      updatedAt: serverTimestamp(),
+      doneAt: status === "done" ? serverTimestamp() : null
     }, { merge: true });
-
-    log("requestAccountDeletion", { ok: true });
+    toast(`Feedback moved to ${status}.`, "success", 2200);
+    await loadAdminDashboard();
   } catch (err) {
-    log("Delete request failed", { message: err.message });
+    console.error("setFeedbackStatus error:", err);
+    toast("Failed: " + (err.message || "unknown error"), "error", 5000);
+  }
+}
+
+async function processDeletion(uid) {
+  const ok = await showConfirm(
+    `Hide profile and mark deletion as processed?\nUID: ${uid}`,
+    "Confirm",
+    true
+  );
+  if (!ok) return;
+  try {
+    await Promise.all([
+      setDoc(doc(db, "profiles", uid), { profileVisible: false, updatedAt: serverTimestamp() }, { merge: true }),
+      setDoc(doc(db, "deletionQueue", uid), { status: "processed", processedAt: serverTimestamp() }, { merge: true }),
+    ]);
+    const el = $(`del-item-${uid}`);
+    if (el) el.remove();
+    const stat = $("adminStatDeletions");
+    if (stat) stat.textContent = String(Math.max(0, Number(stat.textContent) - 1));
+    toast("Profile hidden and marked as processed.", "success", 4500);
+  } catch (err) {
+    console.error("processDeletion error:", err);
+    toast("Failed: " + (err.message || "unknown error"), "error", 5000);
+  }
+}
+
+async function purgeExpiredCooldowns() {
+  const btn = $("adminPurgeCooldownsBtn");
+  if (btn) { btn.disabled = true; btn.textContent = "Purging…"; }
+  try {
+    const snap = await getDocs(collection(db, "unmatchPairs"));
+    const now = Date.now();
+    const staleIds = [];
+    snap.forEach(d => {
+      if (Number(d.data().expiresAtMs || 0) < now) staleIds.push(d.id);
+    });
+    await Promise.all(staleIds.map(id => deleteDoc(doc(db, "unmatchPairs", id))));
+    toast(`Purged ${staleIds.length} expired cooldown${staleIds.length !== 1 ? "s" : ""}.`, "success", 4500);
+    await loadAdminDashboard();
+  } catch (err) {
+    console.error("purgeExpiredCooldowns error:", err);
+    toast("Purge failed: " + (err.message || "unknown error"), "error", 5000);
+    if (btn) { btn.disabled = false; btn.textContent = "Purge expired"; }
+  }
+}
+
+// ── Event Listeners ───────────────────────────────────────────
+
+$("pickAupair").addEventListener("click", () => {
+  selectedRole = "aupair";
+  $("role").value                = "aupair";
+  $("authRoleBadge").textContent = "Au Pair";
+  updateAupairFields("aupair");
+  showView("view-auth");
+});
+
+$("pickHost").addEventListener("click", () => {
+  selectedRole = "host";
+  $("role").value                = "host";
+  $("authRoleBadge").textContent = "Host Family";
+  updateAupairFields("host");
+  showView("view-auth");
+});
+
+$("authBack").addEventListener("click", () => showView("view-landing"));
+
+$("loginBtn").addEventListener("click", async () => {
+  if (!auth) return;
+  if (!validateLegalChecks()) return;
+  if (useLocalEmulators) {
+    toast("Use the demo login button when running locally.", "warning");
+    return;
+  }
+  try {
+    await signInWithPopup(auth, provider);
+  } catch (err) {
+    console.error("Login failed:", err);
+    const msg = err.message?.includes("configuration-not-found")
+      ? "Firebase Auth not configured. Enable Google sign-in in Firebase Console \u2192 Authentication."
+      : (err.message || "Sign-in failed");
+    toast(msg, "error", 8000);
   }
 });
 
-el.runDeleteBtn.addEventListener("click", async () => {
-  if (!currentUser) {
-    log("Sign in first");
-    return;
+$("demoLoginBtn").addEventListener("click", async () => {
+  if (!auth) return;
+  if (!validateLegalChecks()) return;
+  try {
+    await signInAnonymously(auth);
+  } catch (err) {
+    console.error("Demo login failed:", err);
+    toast(err.message || "Demo login failed", "error");
   }
+});
+
+$("logoutBtn").addEventListener("click", async () => {
+  if (!auth) return;
+  const ok = await showConfirm("Sign out of AuPair Rematch?", "Sign out", false);
+  if (ok) await signOut(auth);
+});
+
+$("onboardBack").addEventListener("click", async () => {
+  if (isEditingProfile) {
+    isEditingProfile = false;
+    showView("view-app");
+    showTab("profile");
+  } else {
+    if (auth) await signOut(auth);
+    showView("view-landing");
+  }
+});
+
+$("profileForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (!currentUser || !db) return;
+
+  const btn      = $("saveProfileBtn");
+  const statusEl = $("profileStatus");
+  btn.disabled        = true;
+  btn.textContent     = "Saving\u2026";
+  statusEl.textContent = "";
+  statusEl.className  = "status-msg";
+
+  const interests = $("interests").value.split(",").map(s => s.trim()).filter(Boolean).slice(0, 12);
+  const role      = $("role").value || selectedRole;
+  const alias     = ($("alias").value || "").trim().slice(0, 40) || `user_${currentUser.uid.slice(0, 6)}`;
+
+  const visaRaw   = $("visaMonths").value.trim();
+  const visaNum   = visaRaw !== "" ? parseInt(visaRaw, 10) : null;
 
   try {
+    const hasMatch = await hasActiveMatch(currentUser.uid);
     await setDoc(doc(db, "profiles", currentUser.uid), {
-      alias: "deleted_user",
-      region: "",
-      interests: [],
-      availability: "",
-      about: "",
-      profileVisible: false,
-      deletedAt: serverTimestamp(),
-      updatedAt: serverTimestamp()
+      uid:            currentUser.uid,
+      role,
+      alias,
+      region:         ($("region").value         || "").trim().slice(0, 64),
+      interests,
+      availability:   ($("availability").value   || "").trim().slice(0, 64),
+      countryOfOrigin: ($("countryOfOrigin").value || "").trim().slice(0, 64),
+      visaMonthsLeft:  role === "aupair" ? (Number.isFinite(visaNum) ? visaNum : null) : null,
+      about:          ($("about").value          || "").trim().slice(0, 300),
+      profileVisible: true,
+      hasMatch,
+      matchingState: hasMatch ? "matched" : "discoverable",
+      updatedAt:      serverTimestamp()
     }, { merge: true });
 
-    await setDoc(doc(db, "users", currentUser.uid), {
-      status: "deleted",
-      deletedAt: serverTimestamp(),
-      updatedAt: serverTimestamp()
-    }, { merge: true });
+    statusEl.textContent = "Profile saved!";
+    statusEl.className   = "status-msg";
 
-    const msgSnap = await getDocs(query(collection(db, "messages"), where("senderUid", "==", currentUser.uid), limit(200)));
-    for (const messageDoc of msgSnap.docs) {
-      await deleteDoc(messageDoc.ref);
-    }
+    const profileSnap = await getDoc(doc(db, "profiles", currentUser.uid));
+    renderProfilePreview(profileSnap.data());
 
-    const consentSnap = await getDocs(query(collection(db, "revealConsents"), where("uid", "==", currentUser.uid), limit(200)));
-    for (const consentDoc of consentSnap.docs) {
-      await deleteDoc(consentDoc.ref);
-    }
-
-    await setDoc(doc(db, "deletionQueue", currentUser.uid), {
-      uid: currentUser.uid,
-      status: "completed",
-      completedAt: serverTimestamp()
-    }, { merge: true });
-
-    log("runDeletionJob", { status: "completed" });
+    setTimeout(() => {
+      if (isEditingProfile) {
+        isEditingProfile = false;
+        showView("view-app");
+        showTab("profile");
+      } else {
+        showView("view-app");
+        showTab("discover");
+      }
+    }, 700);
   } catch (err) {
-    log("Deletion job failed", { message: err.message });
+    console.error("Profile save error:", err);
+    const msg = err.code === "permission-denied"
+      ? "Permission denied \u2014 deploy latest Firestore rules."
+      : (err.message || "Save failed");
+    statusEl.textContent = msg;
+    statusEl.className   = "status-msg error";
+  } finally {
+    btn.disabled    = false;
+    btn.textContent = "Save profile";
   }
 });
+
+$("about").addEventListener("input", () => {
+  $("aboutCount").textContent = String($("about").value.length);
+});
+
+document.querySelectorAll(".nav-btn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const tab = btn.dataset.tab;
+    showTab(tab);
+    if (tab === "matches") loadMatches();
+    if (tab === "discover") {
+      updateLikeQuotaUI();
+      loadCandidates();
+    }
+  });
+});
+
+$("loadCandidatesBtn").addEventListener("click", async () => {
+  if (!currentUser) return;
+  const btn = $("loadCandidatesBtn");
+  btn.disabled    = true;
+  btn.textContent = "Loading\u2026";
+  try {
+    await loadCandidates();
+    if (!btn.disabled) {
+      btn.disabled = false;
+      btn.textContent = "Refresh";
+    }
+  } catch (err) {
+    console.error("Load candidates failed:", err);
+    const msg = err.message?.includes("index")
+      ? "A Firestore index is missing. Open the link in browser console to create it."
+      : (err.message || "Failed to load");
+    $("candidates").innerHTML = `<p class="empty-state">${escHtml(msg)}</p>`;
+    btn.disabled    = false;
+    btn.textContent = "Try again";
+  }
+});
+
+$("chatBack").addEventListener("click", () => {
+  $("chatPanel").classList.add("hidden");
+  $("matchesList").style.removeProperty("display");
+  $("view-app").classList.remove("chat-open");
+  setStoredMatchId("");
+  setChatStatus("");
+  setChatComposerEnabled(true, "Type a message…");
+  $("revealBtn").disabled = false;
+  setCloseButtonsDisabled(false);
+  $("chatClosedBanner").classList.add("hidden");
+  $("chatActions").classList.remove("hidden");
+  currentMatchId = null;
+  currentMatchState = "mutual_match";
+});
+
+$("sendMessageBtn").addEventListener("click", async () => {
+  if (!currentMatchId) return;
+  const text = $("messageText").value.trim();
+  if (!text) return;
+  try {
+    await sendMessage(currentMatchId, text);
+    $("messageText").value = "";
+    resizeMessageInput();
+    setChatStatus("");
+    await loadMessages(currentMatchId);
+  } catch (err) {
+    console.error("Send failed:", err);
+    setChatStatus(err.message || "Could not send message", "error");
+    toast(err.message || "Could not send message", "error", 5000);
+  }
+});
+
+$("messageText").addEventListener("input", () => {
+  resizeMessageInput();
+});
+
+$("messageText").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    $("sendMessageBtn").click();
+  }
+});
+
+$("revealBtn").addEventListener("click", async () => {
+  if (!currentMatchId) return;
+  try {
+    await revealConsent(currentMatchId);
+    await loadMatches();
+  } catch (err) {
+    console.error("Reveal failed:", err);
+  }
+});
+
+$('closeMatchBtn').addEventListener('click', async () => {
+  try {
+    await closeCurrentMatch('not_a_fit');
+  } catch (err) {
+    console.error('Close match failed:', err);
+    setChatStatus(err.message || 'Could not close match', 'error');
+    toast(err.message || 'Could not close match', 'error', 5000);
+  }
+});
+
+$('reportCloseBtn').addEventListener('click', async () => {
+  const reason = await showReportModal();
+  if (!reason) return;
+  try {
+    await closeCurrentMatch(reason);
+  } catch (err) {
+    console.error('Report failed:', err);
+    setChatStatus(err.message || 'Could not submit report', 'error');
+    toast(err.message || 'Could not submit report', 'error', 5000);
+  }
+});
+
+$("editProfileBtn").addEventListener("click", async () => {
+  if (!currentUser || !db) return;
+  isEditingProfile = true;
+  const snap = await getDoc(doc(db, "profiles", currentUser.uid));
+  if (snap.exists()) prefillOnboarding(snap.data());
+  showView("view-onboarding");
+});
+
+$("sendFeedbackBtn").addEventListener("click", async () => {
+  try {
+    await sendFeedback();
+  } catch (err) {
+    console.error("Feedback failed:", err);
+    toast(err.message || "Could not send feedback", "error", 5000);
+  }
+});
+
+$("requestDeleteBtn").addEventListener("click", requestDelete);
+
+$("adminLogoutBtn").addEventListener("click", async () => {
+  if (!auth) return;
+  const ok = await showConfirm("Sign out of admin?", "Sign out", false);
+  if (ok) {
+    sessionStorage.removeItem("am_admin_user_mode");
+    await signOut(auth);
+  }
+});
+
+$("adminEnterAppBtn").addEventListener("click", async () => {
+  sessionStorage.setItem("am_admin_user_mode", "1");
+  if (currentUser) {
+    $("userPill").textContent = currentUser.email || "";
+    $("switchToAdminBtn").hidden = false;
+    showLoading(true);
+    try {
+      await ensureUserDocs(currentUser.uid);
+      const profileSnap = await getDoc(doc(db, "profiles", currentUser.uid));
+      const profile = profileSnap.exists() ? profileSnap.data() : null;
+      const hasRealAlias = profile?.alias && !profile.alias.startsWith("user_");
+      if (hasRealAlias) {
+        renderProfilePreview(profile);
+        showView("view-app");
+        showTab(storedTab());
+        loadCandidates().catch(err => console.warn(err));
+      } else {
+        prefillOnboarding(profile);
+        showView("view-onboarding");
+      }
+    } finally {
+      showLoading(false);
+    }
+  }
+});
+
+$("switchToAdminBtn").addEventListener("click", () => {
+  sessionStorage.removeItem("am_admin_user_mode");
+  $("switchToAdminBtn").hidden = true;
+  $("adminUserPill").textContent = currentUser?.email || "";
+  showView("view-admin");
+  loadAdminDashboard().catch(err => console.error(err));
+});
+
+$("adminRefreshBtn").addEventListener("click", () => {
+  loadAdminDashboard().catch(err => console.error("Admin refresh failed:", err));
+});
+
+$("adminPurgeCooldownsBtn").addEventListener("click", purgeExpiredCooldowns);
+
+$("adminDeletionList").addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-action='process-deletion']");
+  if (btn) processDeletion(btn.dataset.uid);
+});
+
+$("adminAbuseList").addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-action='review-report']");
+  if (btn) markReportReviewed(btn.dataset.id);
+});
+
+$("adminFeedbackList").addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-action='set-feedback-status']");
+  if (btn) setFeedbackStatus(btn.dataset.id, btn.dataset.status);
+});
+
+// ── Boot ──────────────────────────────────────────────────────
+(async () => {
+  showLoading(true);
+  const ok = await initFirebase();
+  if (!ok) {
+    showLoading(false);
+    showView("view-landing");
+  }
+})();

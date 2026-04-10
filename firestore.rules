@@ -13,18 +13,30 @@ service cloud.firestore {
       return signedIn() && (data.userA == request.auth.uid || data.userB == request.auth.uid);
     }
 
+    function canSendInThread(threadId) {
+      return exists(/databases/$(database)/documents/matches/$(threadId))
+        && get(/databases/$(database)/documents/matches/$(threadId)).data.state in ["mutual_match", "revealed"];
+    }
+
+    // Replace ADMIN_EMAIL_PLACEHOLDER with your Google account email
+    function isAdmin() {
+      return signedIn()
+        && request.auth.token.email != null
+        && request.auth.token.email == "niru.nirajanpokharel@gmail.com";
+    }
+
     match /users/{uid} {
       allow read, write: if isOwner(uid);
     }
 
     match /profiles/{uid} {
       allow read: if signedIn();
-      allow create, update: if isOwner(uid);
-      allow delete: if false;
+      allow create, update: if isOwner(uid) || isAdmin();
+      allow delete: if isAdmin();
     }
 
     match /matchActions/{docId} {
-      allow read: if signedIn() && (resource.data.actorUid == request.auth.uid || resource.data.targetUid == request.auth.uid);
+      allow read: if isAdmin() || (signedIn() && (resource.data.actorUid == request.auth.uid || resource.data.targetUid == request.auth.uid));
       allow create, update: if signedIn()
         && request.resource.data.actorUid == request.auth.uid
         && request.resource.data.targetUid is string
@@ -33,7 +45,7 @@ service cloud.firestore {
     }
 
     match /matches/{matchId} {
-      allow read: if isParticipant(resource.data);
+      allow read: if isParticipant(resource.data) || isAdmin();
       allow create: if signedIn()
         && request.resource.data.userA is string
         && request.resource.data.userB is string
@@ -43,7 +55,7 @@ service cloud.firestore {
         && isParticipant(resource.data)
         && request.resource.data.userA == resource.data.userA
         && request.resource.data.userB == resource.data.userB;
-      allow delete: if false;
+      allow delete: if isAdmin();
     }
 
     match /threads/{threadId} {
@@ -52,7 +64,7 @@ service cloud.firestore {
         && request.resource.data.userA is string
         && request.resource.data.userB is string
         && (request.resource.data.userA == request.auth.uid || request.resource.data.userB == request.auth.uid);
-      allow update: if signedIn() && isParticipant(resource.data);
+      allow update: if signedIn() && isParticipant(resource.data) && canSendInThread(threadId);
       allow delete: if false;
     }
 
@@ -61,9 +73,24 @@ service cloud.firestore {
       allow create: if signedIn()
         && request.resource.data.senderUid == request.auth.uid
         && request.resource.data.threadId is string
-        && request.auth.uid in request.resource.data.participants;
+        && request.auth.uid in request.resource.data.participants
+        && canSendInThread(request.resource.data.threadId);
       allow update: if false;
       allow delete: if signedIn() && resource.data.senderUid == request.auth.uid;
+    }
+
+    match /unmatchPairs/{pairId} {
+      // resource is null for non-existent docs; allow signed-in reads so cooldown checks work
+      allow read: if isAdmin() || (signedIn() && (
+        !exists(/databases/$(database)/documents/unmatchPairs/$(pairId)) ||
+        resource.data.userA == request.auth.uid ||
+        resource.data.userB == request.auth.uid
+      ));
+      allow create, update: if signedIn()
+        && request.resource.data.userA is string
+        && request.resource.data.userB is string
+        && (request.resource.data.userA == request.auth.uid || request.resource.data.userB == request.auth.uid);
+      allow delete: if isAdmin();
     }
 
     match /revealConsents/{docId} {
@@ -75,7 +102,32 @@ service cloud.firestore {
     }
 
     match /deletionQueue/{uid} {
-      allow read, write: if isOwner(uid);
+      allow read, write: if isOwner(uid) || isAdmin();
+    }
+
+    match /abuseReports/{reportId} {
+      // Any signed-in user can create a report about someone else
+      allow create: if signedIn()
+        && request.resource.data.reporterUid == request.auth.uid
+        && request.resource.data.reportedUid is string
+        && request.resource.data.matchId is string
+        && request.resource.data.reason in ["inappropriate","harassment","fake_profile","other"]
+        && request.resource.data.status == "pending";
+      // Reporter can read their own report; admin can read/update all
+      allow read: if isAdmin() || (signedIn() && resource.data.reporterUid == request.auth.uid);
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    match /feedbackMessages/{feedbackId} {
+      allow create: if signedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.text is string
+        && request.resource.data.status == "todo";
+      allow read: if isAdmin() || (signedIn() && resource.data.uid == request.auth.uid);
+      allow update: if isAdmin()
+        && request.resource.data.status in ["todo", "doing", "done"];
+      allow delete: if false;
     }
 
     match /auditLogs/{docId} {

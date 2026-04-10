@@ -7,73 +7,464 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <main class="app">
-      <header>
-        <h1>AuPair Rematch</h1>
-        <p>Anonymous first. Consent before reveal. Privacy by design.</p>
-      </header>
+    <!-- ── TOAST ──────────────────────────────────────────── -->
+    <div id="toastContainer" class="toast-container"></div>
 
-      <section class="card" id="authCard">
-        <h2>1. Sign In</h2>
-        <button id="loginBtn">Sign in with Google</button>
-        <button id="demoLoginBtn" class="secondary">Local demo login</button>
-        <button id="logoutBtn" class="secondary">Sign out</button>
-        <p id="authState">Not signed in</p>
-      </section>
+    <!-- ── REPORT MODAL ─────────────────────────────────────── -->
+    <div id="reportModal" class="modal-backdrop" aria-hidden="true" hidden>
+      <div class="modal-card report-modal-card" role="dialog" aria-modal="true">
+        <h2>Report &amp; close this chat</h2>
+        <p class="rules-intro">Your report is anonymous to the other person. Our admin team will review it. Please select what happened:</p>
+        <div class="report-options">
+          <label class="report-option"><input type="radio" name="reportReason" value="inappropriate"> Inappropriate or offensive messages</label>
+          <label class="report-option"><input type="radio" name="reportReason" value="harassment"> Harassment or threatening behaviour</label>
+          <label class="report-option"><input type="radio" name="reportReason" value="fake_profile"> Fake or misleading profile</label>
+          <label class="report-option"><input type="radio" name="reportReason" value="other"> Other safety concern</label>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="modal-cancel" id="reportModalCancel">Cancel</button>
+          <button type="button" class="modal-confirm danger" id="reportModalConfirm" disabled>Submit report &amp; close chat</button>
+        </div>
+      </div>
+    </div>
 
-      <section class="card" id="profileCard">
-        <h2>2. Anonymous Profile</h2>
-        <form id="profileForm">
-          <label>Role</label>
-          <select id="role">
-            <option value="aupair">Au pair</option>
-            <option value="host">Host family</option>
-          </select>
+    <!-- ── FEEDBACK MODAL ───────────────────────────────────── -->
+    <div id="feedbackModal" class="modal-backdrop" aria-hidden="true" hidden>
+      <div class="modal-card feedback-modal-card" role="dialog" aria-modal="true">
+        <h2>Send feedback</h2>
+        <p class="rules-intro">Tell us what is working well or what you want improved.</p>
+        <div class="field-group" style="margin-bottom: 0;">
+          <label for="feedbackText">Your feedback</label>
+          <textarea id="feedbackText" maxlength="600" placeholder="Share your thoughts..."></textarea>
+          <span class="char-count"><span id="feedbackCount">0</span>/600</span>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="modal-cancel" id="feedbackModalCancel">Cancel</button>
+          <button type="button" class="modal-confirm safe" id="feedbackModalConfirm" disabled>Send feedback</button>
+        </div>
+      </div>
+    </div>
 
-          <label>Alias</label>
-          <input id="alias" maxlength="40" placeholder="happy-lotus" />
+    <!-- ── SHARED DATALISTS ──────────────────────────────────────── -->
+    <datalist id="countryList">
+      <option value="Afghanistan"><option value="Albania"><option value="Algeria">
+      <option value="Argentina"><option value="Australia"><option value="Austria">
+      <option value="Bangladesh"><option value="Belgium"><option value="Bolivia">
+      <option value="Brazil"><option value="Bulgaria"><option value="Canada">
+      <option value="Chile"><option value="China"><option value="Colombia">
+      <option value="Croatia"><option value="Czech Republic"><option value="Denmark">
+      <option value="Ecuador"><option value="Egypt"><option value="Ethiopia">
+      <option value="Finland"><option value="France"><option value="Germany">
+      <option value="Ghana"><option value="Greece"><option value="Hungary">
+      <option value="India"><option value="Indonesia"><option value="Ireland">
+      <option value="Israel"><option value="Italy"><option value="Japan">
+      <option value="Jordan"><option value="Kenya"><option value="South Korea">
+      <option value="Malaysia"><option value="Mexico"><option value="Morocco">
+      <option value="Nepal"><option value="Netherlands"><option value="New Zealand">
+      <option value="Nigeria"><option value="Norway"><option value="Pakistan">
+      <option value="Peru"><option value="Philippines"><option value="Poland">
+      <option value="Portugal"><option value="Romania"><option value="Russia">
+      <option value="Saudi Arabia"><option value="Serbia"><option value="Singapore">
+      <option value="Slovakia"><option value="South Africa"><option value="Spain">
+      <option value="Sri Lanka"><option value="Sweden"><option value="Switzerland">
+      <option value="Tanzania"><option value="Thailand"><option value="Turkey">
+      <option value="Uganda"><option value="Ukraine"><option value="United Kingdom">
+      <option value="United States"><option value="Venezuela"><option value="Vietnam">
+      <option value="Zimbabwe">
+    </datalist>
+    <!-- regionList is populated dynamically from Firestore -->
+    <datalist id="regionList"></datalist>
 
-          <label>Region</label>
-          <input id="region" maxlength="64" placeholder="Berlin" />
+    <!-- ── CHAT RULES MODAL ─────────────────────────────────── -->
+    <div id="chatRulesModal" class="modal-backdrop" aria-hidden="true" hidden>
+      <div class="modal-card chat-rules-card" role="dialog" aria-modal="true">
+        <h2>Before you chat 👋</h2>
+        <p class="rules-intro">AuPair Rematch is built on trust. Please read and agree to these community guidelines before your first conversation.</p>
+        <ul class="rules-list">
+          <li>🤝 Be respectful and kind at all times</li>
+          <li>🔒 Your identity stays private until <strong>both</strong> of you consent to reveal</li>
+          <li>🚫 No harassment, inappropriate language, or explicit content</li>
+          <li>☝️ Never share contact details early — use the built-in Reveal button</li>
+          <li>🚨 If something feels unsafe, leave the chat and request deletion</li>
+        </ul>
+        <div class="modal-actions">
+          <button type="button" class="modal-cancel" id="chatRulesDecline">Cancel</button>
+          <button type="button" class="modal-confirm safe" id="chatRulesAccept">I agree — start chatting</button>
+        </div>
+      </div>
+    </div>
 
-          <label>Interests (comma separated)</label>
-          <input id="interests" maxlength="120" placeholder="sports, travel, music" />
+    <!-- ── CONFIRM MODAL ──────────────────────────────────── -->
+    <div id="confirmModal" class="modal-backdrop" aria-hidden="true" hidden>
+      <div class="modal-card" role="dialog" aria-modal="true">
+        <p id="modalMsg" class="modal-msg"></p>
+        <div class="modal-actions">
+          <button type="button" class="modal-cancel" id="modalCancel">Cancel</button>
+          <button type="button" class="modal-confirm" id="modalConfirm">Confirm</button>
+        </div>
+      </div>
+    </div>
 
-          <label>Availability</label>
-          <input id="availability" maxlength="64" placeholder="immediate" />
+    <div id="app">
 
-          <label>About</label>
-          <textarea id="about" maxlength="300"></textarea>
+      <!-- ── LANDING: role selection ─────────────────────────── -->
+      <div id="view-landing" class="view active">
+        <div class="landing-inner">
+          <div class="brand">
+            <div class="brand-mark">✦</div>
+            <h1>AuPair Rematch</h1>
+            <p>Anonymous matching. Reveal only when both agree.</p>
+          </div>
+          <p class="landing-who">Who are you?</p>
+          <div class="role-cards">
+            <button class="role-card" id="pickAupair">
+              <span class="role-icon">🧳</span>
+              <strong>Au Pair</strong>
+              <span>I'm looking for a host family</span>
+            </button>
+            <button class="role-card" id="pickHost">
+              <span class="role-icon">🏡</span>
+              <strong>Host Family</strong>
+              <span>We're looking for an au pair</span>
+            </button>
+          </div>
+          <div class="landing-badges">
+            <span><svg class="badge-icon" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 1a4.5 4.5 0 00-4.5 4.5V9H5a2 2 0 00-2 2v6a2 2 0 002 2h10a2 2 0 002-2v-6a2 2 0 00-2-2h-.5V5.5A4.5 4.5 0 0010 1zm3 8V5.5a3 3 0 10-6 0V9h6z" clip-rule="evenodd"/></svg> Private identity</span>
+            <span><svg class="badge-icon" viewBox="0 0 20 20" fill="currentColor"><path d="M2 5a2 2 0 012-2h7a2 2 0 012 2v4a2 2 0 01-2 2H9l-3 3v-3H4a2 2 0 01-2-2V5z"/><path d="M15 7v2a4 4 0 01-4 4H9.828l-1.766 1.767c.28.149.599.233.938.233h2l3 3v-3h2a2 2 0 002-2V9a2 2 0 00-2-2h-1z"/></svg> In-app chat</span>
+            <span><svg class="badge-icon" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zm-.5 6.5a.5.5 0 011 0v4a.5.5 0 01-1 0v-4zm3 0a.5.5 0 011 0v4a.5.5 0 01-1 0v-4z" clip-rule="evenodd"/></svg> Full data deletion</span>
+          </div>
+          <p class="landing-legal-links">
+            <a href="/terms.html" target="_blank" rel="noopener">Terms</a>
+            <span>·</span>
+            <a href="/privacy.html" target="_blank" rel="noopener">Privacy</a>
+          </p>
+        </div>
+      </div>
 
-          <button type="submit">Save profile</button>
-        </form>
-      </section>
+      <!-- ── AUTH: sign in ──────────────────────────────────── -->
+      <div id="view-auth" class="view">
+        <div class="auth-panel">
+          <button class="back-btn" id="authBack">← Back</button>
+          <div class="auth-role-badge" id="authRoleBadge">Au Pair</div>
+          <h2>Welcome</h2>
+          <p class="auth-sub">Sign in to build your anonymous profile and start matching.</p>
+          <div class="auth-legal-checklist">
+            <label class="auth-legal-item">
+              <input type="checkbox" id="ageConfirm" />
+              <span>I confirm I am at least 18 years old.</span>
+            </label>
+            <label class="auth-legal-item">
+              <input type="checkbox" id="legalConfirm" />
+              <span>I agree to the <a href="/terms.html" target="_blank" rel="noopener">Terms</a> and <a href="/privacy.html" target="_blank" rel="noopener">Privacy Policy</a>.</span>
+            </label>
+            <p id="authLegalError" class="auth-legal-error"></p>
+          </div>
+          <button class="btn-google" id="loginBtn">
+            <svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true">
+              <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.08 17.74 9.5 24 9.5z"/>
+              <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>
+              <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/>
+              <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.31-8.16 2.31-6.26 0-11.57-3.59-13.46-8.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>
+            </svg>
+            Continue with Google
+          </button>
+          <button class="btn-demo" id="demoLoginBtn">Demo login (local only)</button>
+          <p class="auth-privacy">By continuing, you acknowledge data processing for matching, messaging, abuse/safety reports, and service quality feedback. See <a href="/privacy.html" target="_blank" rel="noopener">Privacy Policy</a>.</p>
+        </div>
+      </div>
 
-      <section class="card" id="matchingCard">
-        <h2>3. Matching</h2>
-        <button id="loadCandidatesBtn">Load candidates</button>
-        <div id="candidates"></div>
-      </section>
+      <!-- ── ONBOARDING: profile setup ──────────────────────── -->
+      <div id="view-onboarding" class="view">
+        <div class="onboard-panel">
+          <button class="back-btn" id="onboardBack">← Cancel</button>
+          <div class="onboard-header">
+            <div class="onboard-avatar" id="onboardAvatar">?</div>
+            <h2>Build your profile</h2>
+            <p id="onboardSub">Tell us a bit about yourself — nothing here reveals your real identity.</p>
+          </div>
+          <form id="profileForm" class="profile-form">
+            <input type="hidden" id="role" value="aupair" />
+            <button type="button" class="onboard-role-chip" id="onboardRoleChip" title="Tap to switch role">
+              🧳 Au Pair
+              <span class="role-chip-switch">switch ⇄</span>
+            </button>
+            <div class="field-group">
+              <label for="alias">Display name <span class="field-hint">(not your real name)</span></label>
+              <input id="alias" maxlength="40" placeholder="e.g. happy-lotus" autocomplete="off" />
+            </div>
+            <div class="field-group">
+              <label for="region">Location / Region <span class="field-hint">(city or area)</span></label>
+              <input id="region" maxlength="64" placeholder="e.g. Berlin, Sydney" list="regionList" autocomplete="off" />
+            </div>
+            <div class="field-group">
+              <label for="availability">Availability</label>
+              <input id="availability" maxlength="64" placeholder="e.g. Immediate, June 2025" />
+            </div>
+            <div class="field-group">
+              <label for="interests">Interests <span class="field-hint">(comma separated)</span></label>
+              <input id="interests" maxlength="120" placeholder="e.g. hiking, cooking, music" />
+            </div>
+            <!-- country of origin — both roles -->
+            <div class="field-group" id="countryGroup">
+              <label for="countryOfOrigin">Country of origin</label>
+              <input id="countryOfOrigin" maxlength="64" placeholder="Start typing…" list="countryList" autocomplete="off" />
+            </div>
+            <!-- au pair only -->
+            <div class="field-group aupair-field" id="visaGroup">
+              <label for="visaMonths">Months left on visa</label>
+              <input id="visaMonths" type="number" min="0" max="60" placeholder="e.g. 18" />
+            </div>
+            <div class="field-group">
+              <label for="about" id="aboutLabel">About you</label>
+              <textarea id="about" maxlength="300" placeholder="A few sentences about yourself…"></textarea>
+              <span class="char-count"><span id="aboutCount">0</span>/300</span>
+            </div>
+            <button type="submit" class="btn-primary" id="saveProfileBtn">Save profile</button>
+            <p id="profileStatus" class="status-msg"></p>
+          </form>
+        </div>
+      </div>
 
-      <section class="card" id="chatCard">
-        <h2>4. Chat (after reveal)</h2>
-        <input id="threadId" placeholder="match id" />
-        <button id="revealBtn">I consent to reveal</button>
-        <textarea id="messageText" maxlength="2000" placeholder="Type message"></textarea>
-        <button id="sendMessageBtn">Send message</button>
-      </section>
+      <!-- ── MAIN APP ────────────────────────────────────────── -->
+      <div id="view-app" class="view">
 
-      <section class="card" id="deleteCard">
-        <h2>5. Delete My Data</h2>
-        <button id="requestDeleteBtn" class="danger">Request deletion</button>
-        <button id="runDeleteBtn" class="danger secondary">Run deletion now</button>
-      </section>
+        <header class="app-bar">
+          <span class="app-bar-title">AuPair Rematch</span>
+          <div class="app-bar-actions">
+            <span class="user-pill" id="userPill"></span>
+            <button class="btn-secondary btn-sm" id="switchToAdminBtn" hidden>Admin dashboard</button>
+            <button class="btn-signout" id="logoutBtn">Sign out</button>
+          </div>
+        </header>
 
-      <section class="card">
-        <h2>Activity</h2>
-        <pre id="logs"></pre>
-      </section>
-    </main>
+        <div class="tab-panes">
+
+          <!-- Discover -->
+          <div class="tab-pane active" id="tab-discover">
+            <div class="section-head">
+              <h3>Discover</h3>
+              <p class="section-sub" id="discoverSub">Find your perfect match</p>
+              <p class="quota-note" id="likeQuotaText">Selected: 0/3</p>
+            </div>
+            <button class="btn-primary" id="loadCandidatesBtn">Find matches</button>
+            <div id="candidates" class="candidate-grid"></div>
+          </div>
+
+          <!-- Matches -->
+          <div class="tab-pane" id="tab-matches">
+            <div class="section-head">
+              <h3>Matches</h3>
+              <p class="section-sub">Your mutual connections</p>
+            </div>
+            <div id="matchesList" class="matches-list">
+              <p class="empty-state">No matches yet — start discovering!</p>
+            </div>
+            <!-- Chat panel -->
+            <div id="chatPanel" class="chat-panel hidden">
+              <button class="back-btn chat-back-btn" id="chatBack">← Matches</button>
+              <div class="chat-match-header" id="chatMatchHeader"></div>
+              <!-- closed-match notice -->
+              <div id="chatClosedBanner" class="chat-closed-banner hidden">
+                <span class="chat-closed-icon">🔒</span>
+                <div>
+                  <strong>This match has been closed</strong>
+                  <p>Someone in this conversation chose to unmatch. Chat history is read-only.</p>
+                </div>
+              </div>
+              <div id="chatMessages" class="chat-messages"></div>
+              <div class="chat-input-row">
+                <textarea id="messageText" maxlength="2000" placeholder="Type a message…" rows="2"></textarea>
+                <button class="btn-send" id="sendMessageBtn">Send</button>
+              </div>
+              <div class="chat-actions" id="chatActions">
+                <button class="btn-reveal" id="revealBtn">🔓 Consent to reveal identity</button>
+                <div class="chat-close-row">
+                  <button class="btn-close-match" id="closeMatchBtn">End this match</button>
+                  <button class="btn-report" id="reportCloseBtn">🚨 Report &amp; close</button>
+                </div>
+                <p id="chatStatus" class="chat-status"></p>
+              </div>
+            </div>
+          </div>
+
+          <!-- Profile -->
+          <div class="tab-pane" id="tab-profile">
+            <div class="section-head">
+              <h3>My Profile</h3>
+              <p class="section-sub">What others anonymously see</p>
+            </div>
+            <div class="profile-preview" id="profilePreview"></div>
+            <button class="btn-secondary" id="editProfileBtn">Edit profile</button>
+            <button class="btn-secondary" id="sendFeedbackBtn" style="margin-top: 10px;">Send feedback to admin</button>
+            <hr class="divider" />
+            <div class="danger-zone">
+              <h4>Danger zone</h4>
+              <button class="btn-danger" id="requestDeleteBtn">Request data deletion</button>
+            </div>
+          </div>
+
+        </div>
+
+        <nav class="bottom-nav">
+          <button class="nav-btn active" data-tab="discover">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+            <span>Discover</span>
+          </button>
+          <button class="nav-btn" data-tab="matches">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>
+            <span>Matches</span>
+          </button>
+          <button class="nav-btn" data-tab="profile">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+            <span>Profile</span>
+          </button>
+        </nav>
+
+      </div><!-- end view-app -->
+
+      <!-- ── LOADING OVERLAY ─────────────────────────────────── -->
+      <div id="loadingOverlay" class="loading-overlay active">
+        <div class="spinner"></div>
+      </div>
+
+      <!-- ── ADMIN DASHBOARD ───────────────────────────────────── -->
+      <div id="view-admin" class="view">
+        <div class="admin-shell">
+          <header class="admin-bar">
+            <div class="admin-bar-title">
+              <span class="admin-badge">Admin</span>
+              AuPair Rematch
+            </div>
+            <div class="admin-bar-actions">
+              <span class="user-pill" id="adminUserPill"></span>
+              <button class="btn-secondary btn-sm" id="adminEnterAppBtn">Use as regular user</button>
+              <button class="btn-signout" id="adminLogoutBtn">Sign out</button>
+            </div>
+          </header>
+
+          <main class="admin-main">
+            <div class="admin-page-head">
+              <h2>Dashboard</h2>
+              <div class="admin-page-head-row">
+                <p class="admin-last-refresh" id="adminLastRefresh">Loading data…</p>
+                <button class="btn-secondary btn-sm" id="adminRefreshBtn">↺ Refresh</button>
+              </div>
+            </div>
+            <p id="adminStatus" class="admin-status-msg"></p>
+
+            <!-- ── Stats ── -->
+            <section class="admin-section">
+              <h3 class="admin-section-title">Platform stats</h3>
+              <div class="admin-stats-grid">
+                <div class="stat-card">
+                  <div class="stat-value" id="adminStatUsers">—</div>
+                  <div class="stat-label">Total users</div>
+                </div>
+                <div class="stat-card">
+                  <div class="stat-value" id="adminStatAupairs">—</div>
+                  <div class="stat-label">Au Pairs</div>
+                </div>
+                <div class="stat-card">
+                  <div class="stat-value" id="adminStatHosts">—</div>
+                  <div class="stat-label">Host Families</div>
+                </div>
+                <div class="stat-card">
+                  <div class="stat-value stat-green" id="adminStatVisible">—</div>
+                  <div class="stat-label">Discoverable</div>
+                </div>
+                <div class="stat-card">
+                  <div class="stat-value" id="adminStatMatches">—</div>
+                  <div class="stat-label">Total matches</div>
+                </div>
+                <div class="stat-card">
+                  <div class="stat-value stat-green" id="adminStatActive">—</div>
+                  <div class="stat-label">Active matches</div>
+                </div>
+                <div class="stat-card">
+                  <div class="stat-value stat-muted" id="adminStatClosed">—</div>
+                  <div class="stat-label">Closed matches</div>
+                </div>
+                <div class="stat-card">
+                  <div class="stat-value stat-amber" id="adminStatDeletions">—</div>
+                  <div class="stat-label">Pending deletions</div>
+                </div>
+                <div class="stat-card">
+                  <div class="stat-value stat-danger" id="adminStatAbuse">—</div>
+                  <div class="stat-label">Safety reports</div>
+                </div>
+                <div class="stat-card">
+                  <div class="stat-value" id="adminStatFeedback">—</div>
+                  <div class="stat-label">User feedback</div>
+                </div>
+              </div>
+            </section>
+
+            <!-- ── User feedback ── -->
+            <section class="admin-section admin-card">
+              <div class="admin-section-header">
+                <h3 class="admin-section-title">User feedback</h3>
+              </div>
+              <p class="admin-section-desc">
+                Messages sent by users about product quality, usability, and ideas.
+                Feedback stays in history and can be tracked by workflow status.
+              </p>
+              <p class="admin-section-desc feedback-flow-counts">
+                To do: <strong id="adminFeedbackTodoCount">0</strong>
+                · Doing: <strong id="adminFeedbackDoingCount">0</strong>
+                · Done: <strong id="adminFeedbackDoneCount">0</strong>
+              </p>
+              <div id="adminFeedbackList">
+                <p class="empty-state">No feedback yet.</p>
+              </div>
+            </section>
+
+            <!-- ── Safety reports ── -->
+            <section class="admin-section admin-card">
+              <div class="admin-section-header">
+                <h3 class="admin-section-title">Safety reports</h3>
+              </div>
+              <p class="admin-section-desc">
+                Users who reported a safety or abuse concern before closing their chat.
+                "Mark reviewed" acknowledges the report. Consider also checking the
+                reported user's profile and, if necessary, closing it via the Firebase Console.
+              </p>
+              <div id="adminAbuseList">
+                <p class="empty-state">No reports yet.</p>
+              </div>
+            </section>
+
+            <!-- ── Cooldown cleanup ── -->
+            <section class="admin-section admin-card">
+              <div class="admin-section-header">
+                <h3 class="admin-section-title">Cooldown cleanup</h3>
+                <button class="btn-secondary btn-sm" id="adminPurgeCooldownsBtn" disabled>Purge expired</button>
+              </div>
+              <p class="admin-section-desc">
+                <strong id="adminExpiredCooldownCount">0</strong> expired unmatch cooldowns found.
+                These records exist past their cooldown date and can be safely removed to keep the database clean.
+              </p>
+            </section>
+
+            <!-- ── Deletion queue ── -->
+            <section class="admin-section admin-card">
+              <div class="admin-section-header">
+                <h3 class="admin-section-title">Deletion requests</h3>
+              </div>
+              <p class="admin-section-desc">
+                Users who have requested data deletion. "Hide + Mark done" disables their profile and marks
+                the request processed. Full removal of the Auth account and all subcollections requires
+                a Cloud Function or manual action in the Firebase Console.
+              </p>
+              <div id="adminDeletionList">
+                <p class="empty-state">No pending deletion requests.</p>
+              </div>
+            </section>
+
+          </main>
+        </div>
+      </div><!-- end view-admin -->
+
+    </div><!-- end #app -->
 
     <script type="module" src="/app.js"></script>
   </body>
