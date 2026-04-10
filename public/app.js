@@ -45,6 +45,7 @@ const UNMATCH_COOLDOWN_DAYS = 30;
 const CHAT_RULES_KEY = "am_chat_rules_v1";
 const LEGAL_VERSION = "2026-04-10";
 const LEGAL_PENDING_KEY = "am_pending_legal_acceptance";
+const PRIORITY_SCORE = { normal: 1, high: 2, urgent: 3 };
 
 // ── DOM helper ───────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
@@ -1025,15 +1026,51 @@ async function sendFeedback() {
   const feedbackText = await showFeedbackModal();
   if (!feedbackText) return;
 
+  const triage = autoTriageFeedback(feedbackText);
+
   await addDoc(collection(db, "feedbackMessages"), {
     uid: currentUser.uid,
     email: currentUser.email || null,
     text: feedbackText.slice(0, 600),
     status: "todo",
+    autoPriority: triage.priority,
+    autoTags: triage.tags,
+    autoRoute: triage.route,
     createdAt: serverTimestamp()
   });
 
   toast("Thanks for your feedback. Admin has received it.", "success", 4500);
+}
+
+function autoTriageFeedback(text) {
+  const t = String(text || "").toLowerCase();
+  const tags = [];
+  let priority = "normal";
+  let route = "product";
+
+  if (/(crash|error|broken|bug|cannot|can't|not work|fail)/.test(t)) {
+    tags.push("bug");
+    priority = "high";
+    route = "technical";
+  }
+  if (/(abuse|unsafe|threat|harass|scam|fraud)/.test(t)) {
+    tags.push("safety");
+    priority = "urgent";
+    route = "safety";
+  }
+  if (/(feature|idea|improve|suggest)/.test(t)) {
+    tags.push("feature");
+  }
+
+  if (tags.length === 0) tags.push("general");
+  return { priority, tags: Array.from(new Set(tags)), route };
+}
+
+function abusePriorityFromReason(reason) {
+  if (reason === "harassment") return "urgent";
+  if (reason === "inappropriate") return "high";
+  if (reason === "fake_profile") return "high";
+  return "normal";
 }
 
 async function closeCurrentMatch(closeReason = "not_a_fit") {
@@ -1097,12 +1134,15 @@ async function closeCurrentMatch(closeReason = "not_a_fit") {
   }, { merge: true });
 
   if (isReport) {
+    const autoPriority = abusePriorityFromReason(closeReason);
     await addDoc(collection(db, "abuseReports"), {
       reporterUid: currentUser.uid,
       reportedUid: otherUid,
       matchId: currentMatchId,
       reason: closeReason,
       status: "pending",
+      autoPriority,
+      autoRoute: "safety",
       createdAt: serverTimestamp()
     });
   }
@@ -1229,7 +1269,13 @@ async function loadAdminDashboard() {
     const abusePending = [];
     abuseSnap.forEach(d => {
       const data = d.data();
-      if (data.status === "pending") abusePending.push({ id: d.id, ...data });
+      if (data.status === "pending") abusePending.push({ id: d.id, ...data, autoPriority: data.autoPriority || abusePriorityFromReason(data.reason) });
+    });
+
+    abusePending.sort((a, b) => {
+      const p = PRIORITY_SCORE[b.autoPriority] - PRIORITY_SCORE[a.autoPriority];
+      if (p !== 0) return p;
+      return (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0);
     });
 
     const feedbackItems = [];
@@ -1245,7 +1291,11 @@ async function loadAdminDashboard() {
       else if (status === "done") feedbackDone += 1;
     });
 
-    feedbackItems.sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
+    feedbackItems.sort((a, b) => {
+      const p = PRIORITY_SCORE[b.autoPriority || "normal"] - PRIORITY_SCORE[a.autoPriority || "normal"];
+      if (p !== 0) return p;
+      return (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0);
+    });
 
     $("adminStatUsers").textContent     = String(profileSnap.size);
     $("adminStatAupairs").textContent   = String(aupairs);
@@ -1321,6 +1371,7 @@ function renderAdminAbuseReports(items) {
     <div class="admin-deletion-item" id="abuse-item-${escHtml(item.id)}">
       <div class="admin-deletion-meta">
         <strong class="abuse-reason-label">${escHtml(ABUSE_REASON_LABELS[item.reason] || item.reason)}</strong>
+        <span class="admin-del-date">Priority: <span class="feedback-status ${escHtml(item.autoPriority || "normal")}">${escHtml(item.autoPriority || "normal")}</span></span>
         <span class="admin-del-date">Match: <code class="admin-uid">${escHtml(item.matchId || "—")}</code></span>
         <span class="admin-del-date">Reported ${fmtTs(item.createdAt)}</span>
       </div>
@@ -1342,6 +1393,7 @@ function renderAdminFeedback(items) {
     <div class="admin-deletion-item" id="feedback-item-${escHtml(item.id)}">
       <div class="admin-deletion-meta">
         <strong class="abuse-reason-label">${escHtml((item.text || "").slice(0, 220))}</strong>
+        <span class="admin-del-date">Priority: <span class="feedback-status ${escHtml(item.autoPriority || "normal")}">${escHtml(item.autoPriority || "normal")}</span> · Route: ${escHtml(item.autoRoute || "product")}</span>
         <span class="admin-del-date">From UID: <code class="admin-uid">${escHtml(item.uid || "—")}</code></span>
         <span class="admin-del-date">Submitted ${fmtTs(item.createdAt)} · Status: <span class="feedback-status ${escHtml(item.status)}">${escHtml(item.status)}</span></span>
       </div>
