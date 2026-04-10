@@ -28,7 +28,7 @@ import {
 
 const useLocalEmulators = ["localhost", "127.0.0.1"].includes(window.location.hostname);
 
-const firebaseConfig = {
+const baseFirebaseConfig = {
   apiKey: "REPLACE_API_KEY",
   authDomain: "aupair-matching.firebaseapp.com",
   projectId: "aupair-matching",
@@ -36,30 +36,6 @@ const firebaseConfig = {
   messagingSenderId: "REPLACE_SENDER_ID",
   appId: "REPLACE_APP_ID"
 };
-
-if (useLocalEmulators) {
-  firebaseConfig.apiKey = "demo-key";
-  firebaseConfig.authDomain = "demo-aupair-matching.firebaseapp.com";
-  firebaseConfig.projectId = "demo-aupair-matching";
-  firebaseConfig.storageBucket = "demo-aupair-matching.appspot.com";
-  firebaseConfig.messagingSenderId = "000000000000";
-  firebaseConfig.appId = "1:000000000000:web:demo";
-}
-
-if (!useLocalEmulators && firebaseConfig.apiKey.startsWith("REPLACE_")) {
-  console.error("Firebase web config is not set. Update public/app.js with SDK config from Firebase console.");
-}
-
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
-const db = getFirestore(app);
-
-if (useLocalEmulators) {
-  connectAuthEmulator(auth, "http://127.0.0.1:9099", { disableWarnings: true });
-  connectFirestoreEmulator(db, "127.0.0.1", 8085);
-}
-
-const provider = new GoogleAuthProvider();
 
 const el = {
   loginBtn: document.getElementById("loginBtn"),
@@ -85,6 +61,105 @@ const el = {
 };
 
 let currentUser = null;
+let app = null;
+let auth = null;
+let db = null;
+const provider = new GoogleAuthProvider();
+
+function localDemoConfig() {
+  return {
+    apiKey: "demo-key",
+    authDomain: "demo-aupair-matching.firebaseapp.com",
+    projectId: "demo-aupair-matching",
+    storageBucket: "demo-aupair-matching.appspot.com",
+    messagingSenderId: "000000000000",
+    appId: "1:000000000000:web:demo"
+  };
+}
+
+async function resolveFirebaseConfig() {
+  if (useLocalEmulators) {
+    return localDemoConfig();
+  }
+
+  if (!baseFirebaseConfig.apiKey.startsWith("REPLACE_")) {
+    return baseFirebaseConfig;
+  }
+
+  try {
+    const res = await fetch("/__/firebase/init.json", { cache: "no-store" });
+    if (!res.ok) {
+      throw new Error(`init.json request failed: ${res.status}`);
+    }
+    const hostedConfig = await res.json();
+    if (!hostedConfig.apiKey) {
+      throw new Error("init.json missing apiKey");
+    }
+    return {
+      apiKey: hostedConfig.apiKey,
+      authDomain: hostedConfig.authDomain || baseFirebaseConfig.authDomain,
+      projectId: hostedConfig.projectId || baseFirebaseConfig.projectId,
+      storageBucket: hostedConfig.storageBucket || baseFirebaseConfig.storageBucket,
+      messagingSenderId: hostedConfig.messagingSenderId || "",
+      appId: hostedConfig.appId || ""
+    };
+  } catch (err) {
+    log("Firebase config missing", {
+      message: "Create a Firebase Web App and set SDK config or allow Hosting auto-init."
+    });
+    console.error(err);
+    return null;
+  }
+}
+
+async function initFirebase() {
+  const resolvedConfig = await resolveFirebaseConfig();
+  if (!resolvedConfig) {
+    return false;
+  }
+
+  app = initializeApp(resolvedConfig);
+  auth = getAuth(app);
+  db = getFirestore(app);
+
+  if (useLocalEmulators) {
+    connectAuthEmulator(auth, "http://127.0.0.1:9099", { disableWarnings: true });
+    connectFirestoreEmulator(db, "127.0.0.1", 8085);
+  } else {
+    el.demoLoginBtn.style.display = "none";
+  }
+
+  onAuthStateChanged(auth, async (user) => {
+    currentUser = user;
+    if (!user) {
+      el.authState.textContent = "Not signed in";
+      return;
+    }
+
+    const label = user.email || `demo-user:${user.uid.slice(0, 6)}`;
+    el.authState.textContent = `Signed in as ${label}`;
+
+    try {
+      await ensureUserDocs(user.uid);
+      log("User ready", { uid: user.uid });
+    } catch (err) {
+      log("User init failed", { message: err.message });
+    }
+  });
+
+  return true;
+}
+
+const firebaseReady = initFirebase();
+
+async function requireFirebaseReady() {
+  const ok = await firebaseReady;
+  if (!ok || !auth || !db) {
+    log("Firebase not configured for production yet.");
+    return false;
+  }
+  return true;
+}
 
 function log(message, data) {
   const line = data ? `${message} ${JSON.stringify(data)}` : message;
@@ -129,6 +204,7 @@ async function ensureUserDocs(uid) {
 
 el.loginBtn.addEventListener("click", async () => {
   try {
+    if (!(await requireFirebaseReady())) return;
     if (useLocalEmulators) {
       log("Google popup is disabled in local emulator mode. Use Local demo login.");
       return;
@@ -141,6 +217,7 @@ el.loginBtn.addEventListener("click", async () => {
 
 el.demoLoginBtn.addEventListener("click", async () => {
   try {
+    if (!(await requireFirebaseReady())) return;
     await signInAnonymously(auth);
   } catch (err) {
     log("Local demo login failed", { message: err.message });
@@ -148,25 +225,8 @@ el.demoLoginBtn.addEventListener("click", async () => {
 });
 
 el.logoutBtn.addEventListener("click", async () => {
+  if (!(await requireFirebaseReady())) return;
   await signOut(auth);
-});
-
-onAuthStateChanged(auth, async (user) => {
-  currentUser = user;
-  if (!user) {
-    el.authState.textContent = "Not signed in";
-    return;
-  }
-
-  const label = user.email || `demo-user:${user.uid.slice(0, 6)}`;
-  el.authState.textContent = `Signed in as ${label}`;
-
-  try {
-    await ensureUserDocs(user.uid);
-    log("User ready", { uid: user.uid });
-  } catch (err) {
-    log("User init failed", { message: err.message });
-  }
 });
 
 el.profileForm.addEventListener("submit", async (event) => {
