@@ -19,33 +19,59 @@ service cloud.firestore {
 
     match /profiles/{uid} {
       allow read: if signedIn();
-      allow write: if isOwner(uid);
+      allow create, update: if isOwner(uid);
+      allow delete: if false;
     }
 
     match /matchActions/{docId} {
-      allow read: if signedIn() && resource.data.actorUid == request.auth.uid;
-      allow create: if signedIn() && request.resource.data.actorUid == request.auth.uid;
-      allow update, delete: if false;
+      allow read: if signedIn() && (resource.data.actorUid == request.auth.uid || resource.data.targetUid == request.auth.uid);
+      allow create, update: if signedIn()
+        && request.resource.data.actorUid == request.auth.uid
+        && request.resource.data.targetUid is string
+        && request.resource.data.action in ["like", "pass"];
+      allow delete: if false;
     }
 
     match /matches/{matchId} {
       allow read: if isParticipant(resource.data);
-      allow write: if false;
+      allow create: if signedIn()
+        && request.resource.data.userA is string
+        && request.resource.data.userB is string
+        && (request.resource.data.userA == request.auth.uid || request.resource.data.userB == request.auth.uid)
+        && request.resource.data.state in ["mutual_match", "revealed"];
+      allow update: if signedIn()
+        && isParticipant(resource.data)
+        && request.resource.data.userA == resource.data.userA
+        && request.resource.data.userB == resource.data.userB;
+      allow delete: if false;
     }
 
     match /threads/{threadId} {
       allow read: if isParticipant(resource.data);
-      allow write: if false;
+      allow create: if signedIn()
+        && request.resource.data.userA is string
+        && request.resource.data.userB is string
+        && (request.resource.data.userA == request.auth.uid || request.resource.data.userB == request.auth.uid);
+      allow update: if signedIn() && isParticipant(resource.data);
+      allow delete: if false;
     }
 
     match /messages/{messageId} {
       allow read: if signedIn() && request.auth.uid in resource.data.participants;
-      allow write: if false;
+      allow create: if signedIn()
+        && request.resource.data.senderUid == request.auth.uid
+        && request.resource.data.threadId is string
+        && request.auth.uid in request.resource.data.participants;
+      allow update: if false;
+      allow delete: if signedIn() && resource.data.senderUid == request.auth.uid;
     }
 
     match /revealConsents/{docId} {
       allow read: if signedIn() && request.auth.uid in resource.data.participants;
-      allow write: if false;
+      allow create, update: if signedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.auth.uid in request.resource.data.participants;
+      allow delete: if signedIn() && resource.data.uid == request.auth.uid;
     }
 
     match /deletionQueue/{uid} {

@@ -9,10 +9,22 @@ import {
   connectAuthEmulator
 } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
 import {
-  getFunctions,
-  httpsCallable,
-  connectFunctionsEmulator
-} from "https://www.gstatic.com/firebasejs/10.12.5/firebase-functions.js";
+  getFirestore,
+  connectFirestoreEmulator,
+  doc,
+  getDoc,
+  setDoc,
+  updateDoc,
+  deleteDoc,
+  collection,
+  addDoc,
+  query,
+  where,
+  getDocs,
+  serverTimestamp,
+  increment,
+  limit
+} from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
 
 const useLocalEmulators = ["localhost", "127.0.0.1"].includes(window.location.hostname);
 
@@ -40,11 +52,11 @@ if (!useLocalEmulators && firebaseConfig.apiKey.startsWith("REPLACE_")) {
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
-const functions = getFunctions(app);
+const db = getFirestore(app);
 
 if (useLocalEmulators) {
   connectAuthEmulator(auth, "http://127.0.0.1:9099", { disableWarnings: true });
-  connectFunctionsEmulator(functions, "127.0.0.1", 5001);
+  connectFirestoreEmulator(db, "127.0.0.1", 8085);
 }
 
 const provider = new GoogleAuthProvider();
@@ -79,10 +91,40 @@ function log(message, data) {
   el.logs.textContent = `${new Date().toISOString()}  ${line}\n${el.logs.textContent}`;
 }
 
-async function call(name, payload = {}) {
-  const fn = httpsCallable(functions, name);
-  const res = await fn(payload);
-  return res.data;
+function pairKey(uidA, uidB) {
+  return [uidA, uidB].sort().join("_");
+}
+
+async function ensureUserDocs(uid) {
+  const userRef = doc(db, "users", uid);
+  const profileRef = doc(db, "profiles", uid);
+
+  const [userSnap, profileSnap] = await Promise.all([getDoc(userRef), getDoc(profileRef)]);
+
+  if (!userSnap.exists()) {
+    await setDoc(userRef, {
+      uid,
+      status: "active",
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp()
+    });
+  } else {
+    await updateDoc(userRef, { updatedAt: serverTimestamp() });
+  }
+
+  if (!profileSnap.exists()) {
+    await setDoc(profileRef, {
+      uid,
+      role: "aupair",
+      alias: `user_${uid.slice(0, 6)}`,
+      region: "",
+      interests: [],
+      availability: "",
+      about: "",
+      profileVisible: true,
+      updatedAt: serverTimestamp()
+    });
+  }
 }
 
 el.loginBtn.addEventListener("click", async () => {
@@ -118,11 +160,12 @@ onAuthStateChanged(auth, async (user) => {
 
   const label = user.email || `demo-user:${user.uid.slice(0, 6)}`;
   el.authState.textContent = `Signed in as ${label}`;
+
   try {
-    const result = await call("ensureUser");
-    log("ensureUser", result);
+    await ensureUserDocs(user.uid);
+    log("User ready", { uid: user.uid });
   } catch (err) {
-    log("ensureUser failed", { message: err.message });
+    log("User init failed", { message: err.message });
   }
 });
 
@@ -136,18 +179,23 @@ el.profileForm.addEventListener("submit", async (event) => {
   const interests = el.interests.value
     .split(",")
     .map((x) => x.trim())
-    .filter(Boolean);
+    .filter(Boolean)
+    .slice(0, 12);
 
   try {
-    const result = await call("upsertAnonymousProfile", {
-      role: el.role.value,
-      alias: el.alias.value,
-      region: el.region.value,
+    await setDoc(doc(db, "profiles", currentUser.uid), {
+      uid: currentUser.uid,
+      role: el.role.value === "host" ? "host" : "aupair",
+      alias: (el.alias.value || `user_${currentUser.uid.slice(0, 6)}`).trim().slice(0, 40),
+      region: (el.region.value || "").trim().slice(0, 64),
       interests,
-      availability: el.availability.value,
-      about: el.about.value
-    });
-    log("Profile saved", result);
+      availability: (el.availability.value || "").trim().slice(0, 64),
+      about: (el.about.value || "").trim().slice(0, 300),
+      profileVisible: true,
+      updatedAt: serverTimestamp()
+    }, { merge: true });
+
+    log("Profile saved", { ok: true });
   } catch (err) {
     log("Profile save failed", { message: err.message });
   }
@@ -160,11 +208,58 @@ el.loadCandidatesBtn.addEventListener("click", async () => {
   }
 
   try {
-    const result = await call("getCandidates", { region: el.region.value.trim() });
-    log("Candidates loaded", { count: result.candidates.length });
+    const mySnap = await getDoc(doc(db, "profiles", currentUser.uid));
+    if (!mySnap.exists()) {
+      log("Complete profile first");
+      return;
+    }
 
+    const mine = mySnap.data();
+    const targetRole = mine.role === "aupair" ? "host" : "aupair";
+    const requestedRegion = el.region.value.trim() || mine.region || "";
+
+    let candidatesQuery = query(
+      collection(db, "profiles"),
+      where("role", "==", targetRole),
+      where("profileVisible", "==", true),
+      limit(50)
+    );
+
+    if (requestedRegion) {
+      candidatesQuery = query(
+        collection(db, "profiles"),
+        where("role", "==", targetRole),
+        where("profileVisible", "==", true),
+        where("region", "==", requestedRegion),
+        limit(50)
+      );
+    }
+
+    const snap = await getDocs(candidatesQuery);
+    const mineInterests = Array.isArray(mine.interests) ? mine.interests : [];
+
+    const candidates = [];
+    snap.forEach((candidateDoc) => {
+      if (candidateDoc.id === currentUser.uid) return;
+      const p = candidateDoc.data();
+      const theirInterests = Array.isArray(p.interests) ? p.interests : [];
+      const overlap = theirInterests.filter((x) => mineInterests.includes(x)).length;
+      const score = overlap * 10 + ((p.region || "") === (mine.region || "") ? 30 : 0);
+
+      candidates.push({
+        uid: candidateDoc.id,
+        alias: p.alias || "anonymous",
+        role: p.role,
+        region: p.region || "",
+        interests: theirInterests,
+        score
+      });
+    });
+
+    candidates.sort((a, b) => b.score - a.score);
     el.candidates.innerHTML = "";
-    result.candidates.forEach((candidate) => {
+
+    candidates.forEach((candidate) => {
       const wrap = document.createElement("div");
       wrap.className = "candidate";
       wrap.innerHTML = `
@@ -181,19 +276,70 @@ el.loadCandidatesBtn.addEventListener("click", async () => {
       const likeBtn = document.createElement("button");
       likeBtn.textContent = "Like";
       likeBtn.addEventListener("click", async () => {
-        const r = await call("likeCandidate", { targetUid: candidate.uid });
-        if (r.mutual && r.matchId) {
-          el.threadId.value = r.matchId;
+        try {
+          const actionId = `${currentUser.uid}_${candidate.uid}`;
+          const reverseId = `${candidate.uid}_${currentUser.uid}`;
+
+          await setDoc(doc(db, "matchActions", actionId), {
+            actorUid: currentUser.uid,
+            targetUid: candidate.uid,
+            action: "like",
+            createdAt: serverTimestamp()
+          }, { merge: true });
+
+          const reverse = await getDoc(doc(db, "matchActions", reverseId));
+          const mutual = reverse.exists() && reverse.data().action === "like";
+
+          if (!mutual) {
+            log("likeCandidate", { mutual: false });
+            return;
+          }
+
+          const matchId = pairKey(currentUser.uid, candidate.uid);
+          const sorted = [currentUser.uid, candidate.uid].sort();
+
+          await setDoc(doc(db, "matches", matchId), {
+            matchId,
+            userA: sorted[0],
+            userB: sorted[1],
+            state: "mutual_match",
+            revealA: false,
+            revealB: false,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp()
+          }, { merge: true });
+
+          await setDoc(doc(db, "threads", matchId), {
+            threadId: matchId,
+            userA: sorted[0],
+            userB: sorted[1],
+            messageCount: 0,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp()
+          }, { merge: true });
+
+          el.threadId.value = matchId;
+          log("likeCandidate", { mutual: true, matchId });
+        } catch (err) {
+          log("likeCandidate failed", { message: err.message });
         }
-        log("likeCandidate", r);
       });
 
       const passBtn = document.createElement("button");
       passBtn.className = "secondary";
       passBtn.textContent = "Pass";
       passBtn.addEventListener("click", async () => {
-        const r = await call("passCandidate", { targetUid: candidate.uid });
-        log("passCandidate", r);
+        try {
+          await setDoc(doc(db, "matchActions", `${currentUser.uid}_${candidate.uid}`), {
+            actorUid: currentUser.uid,
+            targetUid: candidate.uid,
+            action: "pass",
+            createdAt: serverTimestamp()
+          }, { merge: true });
+          log("passCandidate", { ok: true });
+        } catch (err) {
+          log("passCandidate failed", { message: err.message });
+        }
       });
 
       actions.appendChild(likeBtn);
@@ -201,6 +347,8 @@ el.loadCandidatesBtn.addEventListener("click", async () => {
       wrap.appendChild(actions);
       el.candidates.appendChild(wrap);
     });
+
+    log("Candidates loaded", { count: candidates.length });
   } catch (err) {
     log("Failed to load candidates", { message: err.message });
   }
@@ -212,14 +360,48 @@ el.revealBtn.addEventListener("click", async () => {
     return;
   }
 
-  if (!el.threadId.value.trim()) {
+  const matchId = el.threadId.value.trim();
+  if (!matchId) {
     log("Enter match id in thread field");
     return;
   }
 
   try {
-    const result = await call("setRevealConsent", { matchId: el.threadId.value.trim() });
-    log("setRevealConsent", result);
+    const matchRef = doc(db, "matches", matchId);
+    const matchSnap = await getDoc(matchRef);
+
+    if (!matchSnap.exists()) {
+      log("Match not found");
+      return;
+    }
+
+    const matchData = matchSnap.data();
+    if (matchData.userA !== currentUser.uid && matchData.userB !== currentUser.uid) {
+      log("Not part of this match");
+      return;
+    }
+
+    const patch = { updatedAt: serverTimestamp() };
+    if (matchData.userA === currentUser.uid) patch.revealA = true;
+    if (matchData.userB === currentUser.uid) patch.revealB = true;
+
+    await updateDoc(matchRef, patch);
+
+    const updatedSnap = await getDoc(matchRef);
+    const updated = updatedSnap.data();
+
+    if (updated.revealA && updated.revealB && updated.state !== "revealed") {
+      await updateDoc(matchRef, { state: "revealed", updatedAt: serverTimestamp() });
+    }
+
+    await setDoc(doc(db, "revealConsents", `${matchId}_${currentUser.uid}`), {
+      matchId,
+      uid: currentUser.uid,
+      participants: [updated.userA, updated.userB],
+      consentedAt: serverTimestamp()
+    }, { merge: true });
+
+    log("setRevealConsent", { ok: true });
   } catch (err) {
     log("Reveal failed", { message: err.message });
   }
@@ -231,18 +413,62 @@ el.sendMessageBtn.addEventListener("click", async () => {
     return;
   }
 
-  if (!el.threadId.value.trim()) {
+  const threadId = el.threadId.value.trim();
+  const text = el.messageText.value.trim();
+
+  if (!threadId) {
     log("Enter thread id");
     return;
   }
 
+  if (!text) {
+    log("Type a message first");
+    return;
+  }
+
   try {
-    const result = await call("sendMessage", {
-      threadId: el.threadId.value.trim(),
-      text: el.messageText.value
+    const [threadSnap, matchSnap] = await Promise.all([
+      getDoc(doc(db, "threads", threadId)),
+      getDoc(doc(db, "matches", threadId))
+    ]);
+
+    if (!threadSnap.exists() || !matchSnap.exists()) {
+      log("Thread or match not found");
+      return;
+    }
+
+    const thread = threadSnap.data();
+    const matchData = matchSnap.data();
+
+    if (thread.userA !== currentUser.uid && thread.userB !== currentUser.uid) {
+      log("Not part of this thread");
+      return;
+    }
+
+    if (matchData.state !== "revealed") {
+      log("Identity reveal is required before chat");
+      return;
+    }
+
+    const participants = [thread.userA, thread.userB];
+
+    await addDoc(collection(db, "messages"), {
+      threadId,
+      participants,
+      senderUid: currentUser.uid,
+      text: text.slice(0, 2000),
+      createdAt: serverTimestamp(),
+      purgeAt: Date.now() + (1000 * 60 * 60 * 24 * 30)
     });
-    log("sendMessage", result);
+
+    await updateDoc(doc(db, "threads", threadId), {
+      messageCount: increment(1),
+      lastMessageAt: serverTimestamp(),
+      updatedAt: serverTimestamp()
+    });
+
     el.messageText.value = "";
+    log("sendMessage", { ok: true });
   } catch (err) {
     log("Message failed", { message: err.message });
   }
@@ -253,9 +479,15 @@ el.requestDeleteBtn.addEventListener("click", async () => {
     log("Sign in first");
     return;
   }
+
   try {
-    const result = await call("requestAccountDeletion");
-    log("requestAccountDeletion", result);
+    await setDoc(doc(db, "deletionQueue", currentUser.uid), {
+      uid: currentUser.uid,
+      status: "pending",
+      requestedAt: serverTimestamp()
+    }, { merge: true });
+
+    log("requestAccountDeletion", { ok: true });
   } catch (err) {
     log("Delete request failed", { message: err.message });
   }
@@ -266,9 +498,42 @@ el.runDeleteBtn.addEventListener("click", async () => {
     log("Sign in first");
     return;
   }
+
   try {
-    const result = await call("runDeletionJob");
-    log("runDeletionJob", result);
+    await setDoc(doc(db, "profiles", currentUser.uid), {
+      alias: "deleted_user",
+      region: "",
+      interests: [],
+      availability: "",
+      about: "",
+      profileVisible: false,
+      deletedAt: serverTimestamp(),
+      updatedAt: serverTimestamp()
+    }, { merge: true });
+
+    await setDoc(doc(db, "users", currentUser.uid), {
+      status: "deleted",
+      deletedAt: serverTimestamp(),
+      updatedAt: serverTimestamp()
+    }, { merge: true });
+
+    const msgSnap = await getDocs(query(collection(db, "messages"), where("senderUid", "==", currentUser.uid), limit(200)));
+    for (const messageDoc of msgSnap.docs) {
+      await deleteDoc(messageDoc.ref);
+    }
+
+    const consentSnap = await getDocs(query(collection(db, "revealConsents"), where("uid", "==", currentUser.uid), limit(200)));
+    for (const consentDoc of consentSnap.docs) {
+      await deleteDoc(consentDoc.ref);
+    }
+
+    await setDoc(doc(db, "deletionQueue", currentUser.uid), {
+      uid: currentUser.uid,
+      status: "completed",
+      completedAt: serverTimestamp()
+    }, { merge: true });
+
+    log("runDeletionJob", { status: "completed" });
   } catch (err) {
     log("Deletion job failed", { message: err.message });
   }

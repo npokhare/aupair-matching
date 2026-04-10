@@ -11,12 +11,12 @@ Privacy-first rematch platform starter.
 - Consent-based reveal state
 - In-platform chat after reveal
 - Deletion request and purge workflow
+- Spark-plan friendly runtime (Hosting + Firestore, no deployed Cloud Functions required)
 
 ## Architecture
 
 - Hosting: static web app in `public/`
-- Backend: Firebase Cloud Functions in `functions/`
-- Database: Cloud Firestore with secure rules in `firestore.rules`
+- Database/Auth: Cloud Firestore + Firebase Auth with secure rules in `firestore.rules`
 
 ## 1. Prerequisites
 
@@ -56,7 +56,8 @@ In Firebase Console enable:
 
 - Authentication -> Google provider
 - Firestore database
-- Functions (Blaze plan required)
+
+This app is configured to run on the Spark (free) plan.
 
 ## 3. Install functions dependencies
 
@@ -76,17 +77,16 @@ Open the local Hosting URL shown in terminal.
 
 ## 5. Deploy
 
-Deploy all:
+Deploy Spark-compatible resources:
 
 ```powershell
-firebase deploy
+firebase deploy --only firestore,hosting
 ```
 
 Or deploy in steps:
 
 ```powershell
 firebase deploy --only firestore:rules
-firebase deploy --only functions
 firebase deploy --only hosting
 ```
 
@@ -126,3 +126,4 @@ git push
 - This is an MVP starter and should be hardened before production.
 - Keep personal data minimal.
 - Add App Check, rate limiting, moderation, and legal policy pages before launch.
+- The `functions/` folder is kept for future Blaze-plan migration, but not required for Spark deployment.
