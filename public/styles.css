@@ -632,6 +632,7 @@ body {
   cursor: pointer;
 }
 .btn-pass:hover { background: #f0f0f0; }
+.btn-pass:disabled { opacity: .6; cursor: default; }
 
 .match-burst {
   text-align: center;

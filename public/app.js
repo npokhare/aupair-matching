@@ -12,7 +12,7 @@ import {
   getFirestore, connectFirestoreEmulator,
   doc, getDoc, setDoc, updateDoc, deleteDoc,
   collection, addDoc, getDocs,
-  query, where, limit, serverTimestamp, increment
+  query, where, limit, serverTimestamp, increment, onSnapshot
 } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
 
 // ── Config ──────────────────────────────────────────────────
@@ -37,20 +37,65 @@ let currentUser        = null;
 let isEditingProfile   = false;
 let currentMatchId     = null;
 let currentMatchState  = "mutual_match";
+let currentChatParticipants = [];
+let chatRulesAcceptedForAccount = false;
+let matchesUnreadTotal = 0;
+let matchesCacheEntries = null;
+let matchesCacheAtMs = 0;
+let discoverActionedTargetsCache = null;
+let discoverActionedTargetsCacheAtMs = 0;
+let discoverRefreshCooldownUntilMs = 0;
+let discoverRefreshCooldownTimer = null;
 let app, auth, db;
+let unsubChatMessages  = null;
+let unsubMatchState    = null;
+let lastChatRenderKey  = "";
 const provider = new GoogleAuthProvider();
 const UI_TAB_KEY = "am_active_tab";
 const UI_MATCH_KEY = "am_active_match";
 const UNMATCH_COOLDOWN_DAYS = 30;
+const DISCOVER_BUCKETS_TOTAL = 12;
+const DISCOVER_BUCKETS_PER_WINDOW = 2;
+const DISCOVER_ROTATION_MINUTES = 20;
+const DISCOVER_RENDER_LIMIT = 12;
+const DISCOVER_REFRESH_COOLDOWN_MS = 30000;
+const MATCHES_CACHE_TTL_MS = 60000;
+const DISCOVER_ACTION_CACHE_TTL_MS = 120000;
+const CHAT_RULES_VERSION = "v1";
 const CHAT_RULES_KEY = "am_chat_rules_v1";
 const LEGAL_VERSION = "2026-04-10";
 const LEGAL_PENDING_KEY = "am_pending_legal_acceptance";
+const LEGAL_ACCEPTED_KEY = "am_legal_accepted";
 const PRIORITY_SCORE = { normal: 1, high: 2, urgent: 3 };
 
 // ── DOM helper ───────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
 
+function hasDeviceLegalAcceptance() {
+  const raw = localStorage.getItem(LEGAL_ACCEPTED_KEY);
+  if (!raw) return false;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed?.version === LEGAL_VERSION;
+  } catch (_err) {
+    return false;
+  }
+}
+
+function rememberDeviceLegalAcceptance(acceptedAtMs = Date.now()) {
+  localStorage.setItem(LEGAL_ACCEPTED_KEY, JSON.stringify({
+    version: LEGAL_VERSION,
+    acceptedAtMs: Number(acceptedAtMs) || Date.now()
+  }));
+}
+
 function validateLegalChecks() {
+  if (hasDeviceLegalAcceptance()) {
+    const errorEl = $("authLegalError");
+    if (errorEl) errorEl.textContent = "";
+    return true;
+  }
+
   const ageOk = $("ageConfirm")?.checked;
   const legalOk = $("legalConfirm")?.checked;
   const errorEl = $("authLegalError");
@@ -61,6 +106,7 @@ function validateLegalChecks() {
   }
 
   if (errorEl) errorEl.textContent = "";
+  rememberDeviceLegalAcceptance();
   sessionStorage.setItem(LEGAL_PENDING_KEY, JSON.stringify({
     version: LEGAL_VERSION,
     acceptedAtMs: Date.now()
@@ -85,6 +131,7 @@ async function persistPendingLegalAcceptance(uid) {
       },
       updatedAt: serverTimestamp()
     }, { merge: true });
+    rememberDeviceLegalAcceptance(parsed.acceptedAtMs);
   } catch (_err) {
     // Non-critical; user flow should continue.
   } finally {
@@ -132,6 +179,61 @@ function truncateText(text, maxLen = 180) {
   return `${normalized.slice(0, maxLen).trimEnd()}...`;
 }
 
+function invalidateMatchesCache() {
+  matchesCacheEntries = null;
+  matchesCacheAtMs = 0;
+}
+
+function invalidateDiscoverActionCache() {
+  discoverActionedTargetsCache = null;
+  discoverActionedTargetsCacheAtMs = 0;
+}
+
+async function getActionedTargetsForCurrentUser() {
+  if (!currentUser || !db) return new Map();
+
+  const isFresh = discoverActionedTargetsCache
+    && (Date.now() - discoverActionedTargetsCacheAtMs) < DISCOVER_ACTION_CACHE_TTL_MS;
+  if (isFresh) return new Map(Object.entries(discoverActionedTargetsCache));
+
+  const snap = await getDocs(query(
+    collection(db, "matchActions"),
+    where("actorUid", "==", currentUser.uid),
+    limit(80)
+  ));
+
+  const actioned = new Map();
+  snap.forEach((d) => {
+    const data = d.data() || {};
+    const action = data.action === "like" || data.action === "pass" ? data.action : null;
+    if (data.targetUid && action) actioned.set(data.targetUid, action);
+  });
+
+  discoverActionedTargetsCache = Object.fromEntries(actioned);
+  discoverActionedTargetsCacheAtMs = Date.now();
+  return actioned;
+}
+
+function bucketFromUid(uid, total = DISCOVER_BUCKETS_TOTAL) {
+  const normalized = String(uid || "");
+  if (!normalized) return 0;
+  let hash = 0;
+  for (let i = 0; i < normalized.length; i += 1) {
+    hash = (hash * 31 + normalized.charCodeAt(i)) >>> 0;
+  }
+  return hash % total;
+}
+
+function getDiscoverBucketsForNow(uid) {
+  const nowWindow = Math.floor(Date.now() / (DISCOVER_ROTATION_MINUTES * 60 * 1000));
+  const seed = bucketFromUid(uid, DISCOVER_BUCKETS_TOTAL);
+  const buckets = [];
+  for (let i = 0; i < DISCOVER_BUCKETS_PER_WINDOW; i += 1) {
+    buckets.push((seed + nowWindow + i) % DISCOVER_BUCKETS_TOTAL);
+  }
+  return Array.from(new Set(buckets));
+}
+
 async function getLikeCount(uid) {
   const myActionsSnap = await getDocs(
     query(collection(db, "matchActions"), where("actorUid", "==", uid), limit(50))
@@ -150,6 +252,40 @@ async function updateLikeQuotaUI() {
     $("likeQuotaText").textContent = `Selected: ${likeCount}/3`;
   } catch (_err) {
     $("likeQuotaText").textContent = "Selected: ?/3";
+  }
+}
+
+function applyDiscoverRefreshCooldown() {
+  const btn = $("loadCandidatesBtn");
+  if (!btn) return;
+
+  if (discoverRefreshCooldownTimer) {
+    clearInterval(discoverRefreshCooldownTimer);
+    discoverRefreshCooldownTimer = null;
+  }
+
+  const tick = () => {
+    const remainingMs = discoverRefreshCooldownUntilMs - Date.now();
+    if (remainingMs <= 0) {
+      btn.disabled = false;
+      btn.textContent = "Refresh";
+      discoverRefreshCooldownUntilMs = 0;
+      return false;
+    }
+
+    btn.disabled = true;
+    const seconds = Math.ceil(remainingMs / 1000);
+    btn.textContent = `Refresh in ${seconds}s`;
+    return true;
+  };
+
+  if (tick()) {
+    discoverRefreshCooldownTimer = setInterval(() => {
+      if (!tick() && discoverRefreshCooldownTimer) {
+        clearInterval(discoverRefreshCooldownTimer);
+        discoverRefreshCooldownTimer = null;
+      }
+    }, 1000);
   }
 }
 
@@ -205,8 +341,68 @@ function showConfirm(message, confirmLabel = "Confirm", dangerous = true) {
 }
 
 // ── Chat community guidelines ─────────────────────────────────
+function rememberChatRulesAcceptedLocal(acceptedAtMs = Date.now()) {
+  localStorage.setItem(CHAT_RULES_KEY, JSON.stringify({
+    version: CHAT_RULES_VERSION,
+    acceptedAtMs: Number(acceptedAtMs) || Date.now()
+  }));
+}
+
 function hasChatRulesAccepted() {
-  return localStorage.getItem(CHAT_RULES_KEY) === "true";
+  if (chatRulesAcceptedForAccount) return true;
+  const raw = localStorage.getItem(CHAT_RULES_KEY);
+  if (!raw) return false;
+  if (raw === "true") return true; // backward compatibility
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed?.version === CHAT_RULES_VERSION;
+  } catch (_err) {
+    return false;
+  }
+}
+
+async function persistChatRulesAcceptance(uid, source = "chat-modal") {
+  const acceptedAtMs = Date.now();
+  rememberChatRulesAcceptedLocal(acceptedAtMs);
+  chatRulesAcceptedForAccount = true;
+  if (!db || !uid) return;
+  try {
+    await setDoc(doc(db, "users", uid), {
+      chatRulesAcceptance: {
+        version: CHAT_RULES_VERSION,
+        acceptedAtMs,
+        acceptedAt: serverTimestamp(),
+        source
+      },
+      updatedAt: serverTimestamp()
+    }, { merge: true });
+  } catch (_err) {
+    // Non-critical; do not block chat entry if persistence fails.
+  }
+}
+
+async function ensureChatRulesAccepted(matchId) {
+  if (!currentUser || !db) return true;
+  if (hasChatRulesAccepted()) return true;
+
+  try {
+    const threadSnap = await getDoc(doc(db, "threads", matchId));
+    if (threadSnap.exists()) {
+      const t = threadSnap.data() || {};
+      const hasHistory = Number(t.messageCount || 0) > 0 || Boolean((t.lastMessagePreview || "").trim());
+      if (hasHistory) {
+        await persistChatRulesAcceptance(currentUser.uid, "existing-chat");
+        return true;
+      }
+    }
+  } catch (_err) {
+    // If thread read fails, fall back to explicit consent modal.
+  }
+
+  const accepted = await showChatRulesModal();
+  if (!accepted) return false;
+  await persistChatRulesAcceptance(currentUser.uid, "chat-modal");
+  return true;
 }
 
 function showChatRulesModal() {
@@ -225,7 +421,7 @@ function showChatRulesModal() {
       modal.hidden = true;
       acceptBtn.replaceWith(acceptBtn.cloneNode(true));
       declineBtn.replaceWith(declineBtn.cloneNode(true));
-      if (accepted) localStorage.setItem(CHAT_RULES_KEY, "true");
+      if (accepted) rememberChatRulesAcceptedLocal();
       resolve(accepted);
     };
 
@@ -341,6 +537,7 @@ async function handleAuthChange(user) {
   showLoading(false);
 
   if (!user) {
+    chatRulesAcceptedForAccount = false;
     showView("view-landing");
     return;
   }
@@ -367,6 +564,17 @@ async function handleAuthChange(user) {
   try {
     await ensureUserDocs(user.uid);
     await persistPendingLegalAcceptance(user.uid);
+    const userSnap = await getDoc(doc(db, "users", user.uid));
+    const userData = userSnap.exists() ? (userSnap.data() || {}) : {};
+    const legal = userData.legalAcceptance;
+    const chatLegal = userData.chatRulesAcceptance;
+    if (legal?.version === LEGAL_VERSION || legal?.acceptedAtMs) {
+      rememberDeviceLegalAcceptance(legal.acceptedAtMs || Date.now());
+    }
+    if (chatLegal?.version === CHAT_RULES_VERSION || chatLegal?.acceptedAtMs) {
+      chatRulesAcceptedForAccount = true;
+      rememberChatRulesAcceptedLocal(chatLegal.acceptedAtMs || Date.now());
+    }
     const profileSnap = await getDoc(doc(db, "profiles", user.uid));
     const profile = profileSnap.exists() ? profileSnap.data() : null;
 
@@ -456,6 +664,7 @@ async function ensureUserDocs(uid) {
       region: "", interests: [], availability: "",
       countryOfOrigin: "", visaMonthsLeft: null,
       about: "",
+      serveBucket: bucketFromUid(uid),
       profileVisible: true, updatedAt: serverTimestamp()
     });
   }
@@ -533,26 +742,60 @@ async function loadCandidates() {
 
   await updateLikeQuotaUI();
 
+  const myMatchDocs = await fetchMatchesForUser(currentUser.uid);
+  const activeMatchedUids = new Set();
+  myMatchDocs.forEach((d) => {
+    const m = d.data() || {};
+    if (m.state === "unmatched") return;
+    const otherUid = m.userA === currentUser.uid ? m.userB : m.userA;
+    if (otherUid) activeMatchedUids.add(otherUid);
+  });
+
   const mySnap = await getDoc(doc(db, "profiles", currentUser.uid));
   if (!mySnap.exists()) return;
+  const actionedTargets = await getActionedTargetsForCurrentUser();
 
   const mine       = mySnap.data();
   const targetRole = mine.role === "aupair" ? "host" : "aupair";
   const roleLabel  = targetRole === "host" ? "host families" : "au pairs";
-  $("discoverSub").textContent = `Showing ${roleLabel} near you`;
+  const activeBuckets = getDiscoverBucketsForNow(currentUser.uid);
+  $("discoverSub").textContent = `Showing rotating ${roleLabel} batch`;
 
-  const snap = await getDocs(query(
-    collection(db, "profiles"),
-    where("role", "==", targetRole),
-    where("profileVisible", "==", true),
-    limit(50)
-  ));
+  let snap;
+  try {
+    snap = await getDocs(query(
+      collection(db, "profiles"),
+      where("role", "==", targetRole),
+      where("profileVisible", "==", true),
+      where("serveBucket", "in", activeBuckets),
+      limit(30)
+    ));
+
+    // Migration fallback for older profiles that don't have serveBucket yet.
+    if (snap.empty) {
+      snap = await getDocs(query(
+        collection(db, "profiles"),
+        where("role", "==", targetRole),
+        where("profileVisible", "==", true),
+        limit(30)
+      ));
+    }
+  } catch (_err) {
+    // Fallback if composite index is not ready yet.
+    snap = await getDocs(query(
+      collection(db, "profiles"),
+      where("role", "==", targetRole),
+      where("profileVisible", "==", true),
+      limit(30)
+    ));
+  }
 
   const mineInterests = Array.isArray(mine.interests) ? mine.interests : [];
   const candidates = [];
 
   snap.forEach(d => {
     if (d.id === currentUser.uid) return;
+    const actionState = actionedTargets.get(d.id) || null;
     const p = d.data();
     const theirInterests = Array.isArray(p.interests) ? p.interests : [];
     const overlap = theirInterests.filter(x => mineInterests.includes(x)).length;
@@ -565,7 +808,8 @@ async function loadCandidates() {
       countryOfOrigin: p.countryOfOrigin || "",
       visaMonthsLeft: p.visaMonthsLeft ?? null,
       about: p.about || "",
-      matched: p.matchingState === "matched" || p.hasMatch === true,
+      actionState,
+      matched: activeMatchedUids.has(d.id) || p.matchingState === "matched" || p.hasMatch === true,
       score,
       sameRegion,
       overlap
@@ -585,12 +829,10 @@ async function loadCandidates() {
 
   if (visibleCandidates.length === 0) {
     grid.innerHTML = `<p class="empty-state">No candidates available right now — check back later.</p>`;
-    $("loadCandidatesBtn").disabled = false;
-    $("loadCandidatesBtn").textContent = "Refresh";
     return;
   }
 
-  visibleCandidates.forEach(c => {
+  visibleCandidates.slice(0, DISCOVER_RENDER_LIMIT).forEach(c => {
     const card = document.createElement("div");
     card.className = "candidate-card";
     const cRoleLabel = c.role === "host" ? "Host Family" : "Au Pair";
@@ -600,12 +842,21 @@ async function loadCandidates() {
       ? `<span><svg class="meta-icon" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M4 4a2 2 0 012-2h4.586A2 2 0 0112 2.586L15.414 6A2 2 0 0116 7.414V16a2 2 0 01-2 2H6a2 2 0 01-2-2V4zm2 6a1 1 0 011-1h6a1 1 0 110 2H7a1 1 0 01-1-1zm1 3a1 1 0 100 2h6a1 1 0 100-2H7z" clip-rule="evenodd"/></svg> ${escHtml(String(c.visaMonthsLeft))} mo. visa</span>` : "";
     const countryLine = c.countryOfOrigin
       ? `<span><svg class="meta-icon" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M3 6a3 3 0 013-3h10a1 1 0 01.8 1.6L14.25 8l2.55 3.4A1 1 0 0116 13H6a1 1 0 00-1 1v3a1 1 0 11-2 0V6z" clip-rule="evenodd"/></svg> ${escHtml(c.countryOfOrigin)}</span>` : "";
+    const liked = c.actionState === "like";
+    const passed = c.actionState === "pass";
+    const likeDisabled = c.matched || liked;
+    const passDisabled = c.matched || passed;
+    const likeLabel = c.matched ? "Matched" : (liked ? "Liked" : "💚 Like");
+    const passLabel = passed ? "Passed" : "Pass";
+    const actionBadge = c.matched
+      ? '<span class="candidate-match-badge">Matched</span>'
+      : (liked ? '<span class="candidate-match-badge">Liked</span>' : (passed ? '<span class="candidate-match-badge">Passed</span>' : ""));
 
     card.innerHTML = `
       <div class="candidate-top">
         <div class="candidate-avatar">${escHtml(c.alias[0].toUpperCase())}</div>
         <div class="candidate-meta">
-          <strong>${escHtml(c.alias)} ${c.matched ? '<span class="candidate-match-badge">Matched</span>' : ''}</strong>
+          <strong>${escHtml(c.alias)} ${actionBadge}</strong>
           <div class="role-tag">${cRoleLabel}${countryLine ? " · " + countryLine : ""}${visaLine ? " · " + visaLine : ""}</div>
         </div>
       </div>
@@ -613,13 +864,19 @@ async function loadCandidates() {
       ${c.about ? `<p class="candidate-about"><strong>About:</strong> ${escHtml(truncateText(c.about, 220))}</p>` : ""}
       ${tags ? `<div class="interest-tags">${tags}</div>` : ""}
       <div class="candidate-actions">
-        <button class="btn-like">💚 Like</button>
-        <button class="btn-pass">Pass</button>
+        <button class="btn-like" ${likeDisabled ? "disabled" : ""}>${likeLabel}</button>
+        <button class="btn-pass" ${passDisabled ? "disabled" : ""}>${passLabel}</button>
       </div>
     `;
 
-    card.querySelector(".btn-like").addEventListener("click", () => likeCandidate(c.uid, c.alias, card));
-    card.querySelector(".btn-pass").addEventListener("click", () => passCandidate(c.uid, card));
+    const likeBtn = card.querySelector(".btn-like");
+    if (!likeDisabled && likeBtn) {
+      likeBtn.addEventListener("click", () => likeCandidate(c.uid, c.alias, card));
+    }
+    const passBtn = card.querySelector(".btn-pass");
+    if (!passDisabled && passBtn) {
+      passBtn.addEventListener("click", () => passCandidate(c.uid, card));
+    }
     grid.appendChild(card);
   });
 }
@@ -654,6 +911,7 @@ async function likeCandidate(targetUid, targetAlias, cardEl) {
       actorUid: currentUser.uid, targetUid, action: "like",
       createdAt: serverTimestamp()
     }, { merge: true });
+    invalidateDiscoverActionCache();
 
     const reverse = await getDoc(doc(db, "matchActions", reverseId));
     const mutual  = reverse.exists() && reverse.data().action === "like";
@@ -670,7 +928,14 @@ async function likeCandidate(targetUid, targetAlias, cardEl) {
 
       await setDoc(doc(db, "threads", matchId), {
         threadId: matchId, userA: sorted[0], userB: sorted[1],
-        messageCount: 0, createdAt: serverTimestamp(), updatedAt: serverTimestamp()
+        messageCount: 0,
+        unreadCountA: 0,
+        unreadCountB: 0,
+        lastReadAtA: null,
+        lastReadAtB: null,
+        lastSenderUid: null,
+        lastMessagePreview: "",
+        createdAt: serverTimestamp(), updatedAt: serverTimestamp()
       }, { merge: true });
 
       await setDoc(doc(db, "profiles", currentUser.uid), {
@@ -679,6 +944,9 @@ async function likeCandidate(targetUid, targetAlias, cardEl) {
         profileVisible: true,
         updatedAt: serverTimestamp()
       }, { merge: true });
+
+      invalidateMatchesCache();
+      invalidateDiscoverActionCache();
 
       cardEl.innerHTML = `
         <div class="match-burst">
@@ -709,6 +977,7 @@ async function passCandidate(targetUid, cardEl) {
       createdAt: serverTimestamp()
     }, { merge: true });
     await updateLikeQuotaUI();
+    invalidateDiscoverActionCache();
     cardEl.style.display = "none";
   } catch (err) {
     console.error("Pass failed:", err);
@@ -716,33 +985,25 @@ async function passCandidate(targetUid, cardEl) {
 }
 
 // ── Matches & Chat ────────────────────────────────────────────
-async function loadMatches() {
-  if (!currentUser || !db) return;
-
-  const resumeMatchId = storedMatchId();
-  let resumeMatchData = null;
-
-  const [snapA, snapB] = await Promise.all([
-    getDocs(query(collection(db, "matches"), where("userA", "==", currentUser.uid))),
-    getDocs(query(collection(db, "matches"), where("userB", "==", currentUser.uid)))
-  ]);
-
-  const matchDocs = [...snapA.docs, ...snapB.docs];
+function renderMatchesList(matchEntries, resumeMatchId = "") {
   const list = $("matchesList");
+  let resumeMatchData = null;
+  let totalUnread = 0;
 
-  if (matchDocs.length === 0) {
+  if (!Array.isArray(matchEntries) || matchEntries.length === 0) {
+    matchesUnreadTotal = 0;
+    setMatchesTabUnreadBadge(0);
     list.innerHTML = `<p class="empty-state">No matches yet — start discovering!</p>`;
     return;
   }
 
   list.innerHTML = "";
 
-  for (const matchDoc of matchDocs) {
-    const m        = matchDoc.data();
-    const otherUid = m.userA === currentUser.uid ? m.userB : m.userA;
-
-    const otherSnap = await getDoc(doc(db, "profiles", otherUid));
-    const other     = otherSnap.exists() ? otherSnap.data() : { alias: "Anonymous", role: "aupair" };
+  for (const entry of matchEntries) {
+    const m = entry.match;
+    const other = entry.other;
+    const unreadCount = Number(entry.unreadCount || 0);
+    totalUnread += unreadCount;
 
     const item = document.createElement("div");
     item.className = "match-item";
@@ -756,28 +1017,79 @@ async function loadMatches() {
     item.innerHTML = `
       <div class="match-avatar">${escHtml((other.alias || "A")[0].toUpperCase())}</div>
       <div class="match-info">
-        <strong>${escHtml(other.alias || "Anonymous")}</strong>
+        <strong>${escHtml(other.alias || "Anonymous")}${unreadCount > 0 ? ` <span class="candidate-match-badge">${unreadCount} new</span>` : ""}</strong>
         <small>${cRoleLabel} · ${stateLabel}</small>
         ${aboutPreview ? `<p class="match-about">${escHtml(aboutPreview)}</p>` : ""}
       </div>
       <span class="match-chevron">${m.state === "unmatched" ? "🔒" : "›"}</span>
     `;
 
-    if (m.state === "unmatched") {
-      item.classList.add("closed");
-    }
+    if (m.state === "unmatched") item.classList.add("closed");
 
-    item.addEventListener("click", () => openChat(m.matchId, other, m.state || "mutual_match"));
+    item.addEventListener("click", () => openChat(m.matchId, other, m.state || "mutual_match", unreadCount));
     list.appendChild(item);
 
     if (m.matchId === resumeMatchId) {
-      resumeMatchData = { matchId: m.matchId, other, state: m.state || "mutual_match" };
+      resumeMatchData = { matchId: m.matchId, other, state: m.state || "mutual_match", unreadCount };
     }
   }
 
+  matchesUnreadTotal = totalUnread;
+  setMatchesTabUnreadBadge(totalUnread);
+
   if (resumeMatchData) {
-    openChat(resumeMatchData.matchId, resumeMatchData.other, resumeMatchData.state);
+    openChat(resumeMatchData.matchId, resumeMatchData.other, resumeMatchData.state, resumeMatchData.unreadCount || 0);
   }
+}
+
+async function loadMatches(force = false) {
+  if (!currentUser || !db) return;
+
+  const resumeMatchId = storedMatchId();
+  const cacheFresh = !force
+    && Array.isArray(matchesCacheEntries)
+    && (Date.now() - matchesCacheAtMs) < MATCHES_CACHE_TTL_MS;
+
+  if (cacheFresh) {
+    renderMatchesList(matchesCacheEntries, resumeMatchId);
+    return;
+  }
+
+  const [snapA, snapB] = await Promise.all([
+    getDocs(query(collection(db, "matches"), where("userA", "==", currentUser.uid))),
+    getDocs(query(collection(db, "matches"), where("userB", "==", currentUser.uid)))
+  ]);
+
+  const matchDocs = [...snapA.docs, ...snapB.docs];
+  if (matchDocs.length === 0) {
+    matchesCacheEntries = [];
+    matchesCacheAtMs = Date.now();
+    renderMatchesList([], resumeMatchId);
+    return;
+  }
+
+  const entries = [];
+  for (const matchDoc of matchDocs) {
+    const m        = matchDoc.data();
+    const otherUid = m.userA === currentUser.uid ? m.userB : m.userA;
+
+    const otherSnap = await getDoc(doc(db, "profiles", otherUid));
+    const otherData = otherSnap.exists() ? otherSnap.data() : { alias: "Anonymous", role: "aupair" };
+    const other     = { uid: otherUid, ...otherData };
+    const threadSnap = await getDoc(doc(db, "threads", m.matchId));
+    const threadData = threadSnap.exists() ? threadSnap.data() : { userA: m.userA, userB: m.userB };
+    const unreadCount = m.state === "unmatched" ? 0 : getUnreadCountForUid(threadData, currentUser.uid);
+
+    entries.push({
+      match: { matchId: m.matchId, state: m.state || "mutual_match" },
+      other,
+      unreadCount
+    });
+  }
+
+  matchesCacheEntries = entries;
+  matchesCacheAtMs = Date.now();
+  renderMatchesList(entries, resumeMatchId);
 }
 
 function setChatComposerEnabled(enabled, placeholder = "Type a message…") {
@@ -789,12 +1101,204 @@ function setChatComposerEnabled(enabled, placeholder = "Type a message…") {
   textEl.placeholder = placeholder;
 }
 
-async function openChat(matchId, otherProfile, matchState = "mutual_match") {
+function setMatchesTabUnreadBadge(count) {
+  const btn = document.querySelector('.nav-btn[data-tab="matches"]');
+  if (!btn) return;
+
+  const normalized = Number(count) > 0 ? Number(count) : 0;
+  const labelEl = btn.querySelector("span");
+  if (!labelEl) return;
+
+  const currentLabel = (labelEl.textContent || "").trim();
+  const base = btn.dataset.baseLabel || currentLabel.replace(/\s*\(\d+\)\s*$/, "").trim() || "Matches";
+  btn.dataset.baseLabel = base;
+  labelEl.textContent = normalized > 0 ? `${base} (${normalized})` : base;
+}
+
+function getThreadRoleForUid(threadLike, uid) {
+  if (!threadLike || !uid) return null;
+  if (threadLike.userA === uid) return "A";
+  if (threadLike.userB === uid) return "B";
+  return null;
+}
+
+function getUnreadCountForUid(threadLike, uid) {
+  const role = getThreadRoleForUid(threadLike, uid);
+  if (role === "A") return Number(threadLike.unreadCountA || 0);
+  if (role === "B") return Number(threadLike.unreadCountB || 0);
+  return 0;
+}
+
+async function markThreadRead(threadId) {
+  if (!currentUser || !db || !threadId) return;
+
+  try {
+    const threadRef = doc(db, "threads", threadId);
+    const snap = await getDoc(threadRef);
+    if (!snap.exists()) return;
+
+    const t = snap.data();
+    const role = getThreadRoleForUid(t, currentUser.uid);
+    if (!role) return;
+
+    const unread = role === "A"
+      ? Number(t.unreadCountA || 0)
+      : Number(t.unreadCountB || 0);
+
+    if (unread <= 0) return;
+
+    const patch = {
+      updatedAt: serverTimestamp()
+    };
+    if (role === "A") {
+      patch.unreadCountA = 0;
+      patch.lastReadAtA = serverTimestamp();
+    } else {
+      patch.unreadCountB = 0;
+      patch.lastReadAtB = serverTimestamp();
+    }
+
+    await updateDoc(threadRef, patch);
+    invalidateMatchesCache();
+  } catch (_err) {
+    // Non-critical: unread indicators can recover on next refresh.
+  }
+}
+
+function stopChatRealtime() {
+  if (typeof unsubChatMessages === "function") {
+    unsubChatMessages();
+  }
+  if (typeof unsubMatchState === "function") {
+    unsubMatchState();
+  }
+  unsubChatMessages = null;
+  unsubMatchState = null;
+  lastChatRenderKey = "";
+  currentChatParticipants = [];
+}
+
+function applyChatStateUI(matchState) {
+  const isClosed = matchState === "unmatched";
+
+  if (isClosed) {
+    $("chatClosedBanner").classList.remove("hidden");
+    $("chatActions").classList.add("hidden");
+    setChatComposerEnabled(false, "This chat is closed.");
+  } else {
+    $("chatClosedBanner").classList.add("hidden");
+    $("chatActions").classList.remove("hidden");
+    setChatComposerEnabled(true, "Type a message…");
+  }
+}
+
+function renderChatMessages(msgs) {
+  const container = $("chatMessages");
+  if (!container) return;
+
+  const last = msgs.length ? msgs[msgs.length - 1] : null;
+  const nextKey = `${msgs.length}:${last?.id || ""}:${last?.createdAt?.seconds || 0}`;
+  if (nextKey === lastChatRenderKey) return;
+  lastChatRenderKey = nextKey;
+
+  container.innerHTML = "";
+  if (msgs.length === 0) {
+    container.innerHTML = `<p class="empty-state" style="padding:16px 0">No messages yet - say hello!</p>`;
+    return;
+  }
+
+  msgs.forEach(msg => {
+    const div = document.createElement("div");
+    div.className = `chat-msg ${msg.senderUid === currentUser.uid ? "mine" : "theirs"}`;
+    div.textContent = msg.text || "";
+    container.appendChild(div);
+  });
+
+  container.scrollTop = container.scrollHeight;
+}
+
+function subscribeChatMessages(matchId) {
+  // Preferred low-read query: only this thread.
+  const preferredQuery = query(
+    collection(db, "messages"),
+    where("threadId", "==", matchId),
+    limit(120)
+  );
+
+  let fallbackAttached = false;
+
+  const attachFallback = () => {
+    if (fallbackAttached) return;
+    fallbackAttached = true;
+
+    const fallbackQuery = query(
+      collection(db, "messages"),
+      where("participants", "array-contains", currentUser.uid),
+      limit(300)
+    );
+
+    unsubChatMessages = onSnapshot(fallbackQuery, (snap) => {
+      const msgs = [];
+      snap.forEach((d) => {
+        const data = d.data();
+        if (data.threadId === matchId) msgs.push({ id: d.id, ...data });
+      });
+      msgs.sort((a, b) => (a.createdAt?.seconds || 0) - (b.createdAt?.seconds || 0));
+      renderChatMessages(msgs);
+      setChatStatus("");
+    }, (err) => {
+      console.error("Realtime fallback listener failed:", err);
+      setChatStatus("Could not load live chat updates.", "error");
+      toast("Live chat unavailable right now.", "error", 4500);
+    });
+  };
+
+  unsubChatMessages = onSnapshot(preferredQuery, (snap) => {
+    const msgs = [];
+    snap.forEach((d) => msgs.push({ id: d.id, ...d.data() }));
+    msgs.sort((a, b) => (a.createdAt?.seconds || 0) - (b.createdAt?.seconds || 0));
+    renderChatMessages(msgs);
+    setChatStatus("");
+  }, (err) => {
+    console.warn("Preferred realtime query failed, using fallback:", err);
+    attachFallback();
+  });
+}
+
+function startChatRealtime(matchId) {
+  if (!currentUser || !db || !matchId) return;
+  stopChatRealtime();
+
+  // Avoid reads while tab is in the background.
+  if (document.hidden) return;
+
+  setChatStatus("Connecting live chat...", "info");
+  subscribeChatMessages(matchId);
+
+  unsubMatchState = onSnapshot(doc(db, "matches", matchId), (snap) => {
+    if (!snap.exists()) {
+      currentMatchState = "unmatched";
+      applyChatStateUI("unmatched");
+      setChatStatus("This match no longer exists.", "error");
+      return;
+    }
+
+    const data = snap.data() || {};
+    const state = data.state || "mutual_match";
+    currentChatParticipants = [data.userA, data.userB].filter(Boolean);
+    currentMatchState = state;
+    applyChatStateUI(state);
+  }, (err) => {
+    console.error("Match state listener failed:", err);
+  });
+}
+
+async function openChat(matchId, otherProfile, matchState = "mutual_match", initialUnread = 0) {
   const isClosed = matchState === "unmatched";
 
   // First-time chat: show community guidelines gate
   if (!isClosed && !hasChatRulesAccepted()) {
-    const accepted = await showChatRulesModal();
+    const accepted = await ensureChatRulesAccepted(matchId);
     if (!accepted) return;
   }
 
@@ -810,6 +1314,10 @@ async function openChat(matchId, otherProfile, matchState = "mutual_match") {
 
   currentMatchId = matchId;
   currentMatchState = matchState;
+  currentChatParticipants =
+    (otherProfile && otherProfile.uid)
+      ? [currentUser.uid, otherProfile.uid].filter(Boolean).sort()
+      : [];
   setStoredMatchId(matchId);
   $("chatMatchHeader").innerHTML = `
     <strong>Chat with ${escHtml(alias)}${isClosed ? ' <span class="chat-header-closed">· Closed</span>' : ""}</strong>
@@ -819,18 +1327,23 @@ async function openChat(matchId, otherProfile, matchState = "mutual_match") {
   $("chatPanel").classList.remove("hidden");
   $("view-app").classList.add("chat-open");
 
-  if (isClosed) {
-    $("chatClosedBanner").classList.remove("hidden");
-    $("chatActions").classList.add("hidden");
-    setChatComposerEnabled(false, "This chat is closed.");
-  } else {
-    $("chatClosedBanner").classList.add("hidden");
-    $("chatActions").classList.remove("hidden");
-    setChatComposerEnabled(true, "Type a message…");
-  }
+  applyChatStateUI(matchState);
   setChatStatus("");
   resizeMessageInput();
-  loadMessages(matchId);
+  startChatRealtime(matchId);
+  if (!isClosed) {
+    markThreadRead(matchId);
+    if (initialUnread > 0) {
+      matchesUnreadTotal = Math.max(0, matchesUnreadTotal - Number(initialUnread));
+      setMatchesTabUnreadBadge(matchesUnreadTotal);
+      if (Array.isArray(matchesCacheEntries)) {
+        matchesCacheEntries = matchesCacheEntries.map((entry) => {
+          if (entry?.match?.matchId !== matchId) return entry;
+          return { ...entry, unreadCount: 0 };
+        });
+      }
+    }
+  }
 }
 
 function setChatStatus(text, tone = "info") {
@@ -899,28 +1412,31 @@ async function loadMessages(matchId) {
 async function sendMessage(matchId, text) {
   if (!currentUser || !db || !text.trim()) return;
 
+  const trimmedText = text.trim().slice(0, 2000);
+
   if (currentMatchState === "unmatched") {
     throw new Error("This chat is closed because the match was removed.");
   }
 
-  const matchSnap = await getDoc(doc(db, "matches", matchId));
-  if (!matchSnap.exists()) {
-    throw new Error("Match no longer exists");
-  }
-  const matchData = matchSnap.data();
-  if (matchData.state === "unmatched") {
-    currentMatchState = "unmatched";
-    setChatComposerEnabled(false, "This chat is closed after unmatch.");
-    throw new Error("This chat is closed because the match was removed.");
-  }
+  let participants = Array.isArray(currentChatParticipants)
+    ? currentChatParticipants.filter(Boolean)
+    : [];
 
-  const threadSnap = await getDoc(doc(db, "threads", matchId));
-  if (!threadSnap.exists()) {
-    throw new Error("Thread not found");
+  // Fallback for first send before realtime match snapshot arrives.
+  if (participants.length < 2) {
+    const matchSnap = await getDoc(doc(db, "matches", matchId));
+    if (!matchSnap.exists()) {
+      throw new Error("Match no longer exists");
+    }
+    const matchData = matchSnap.data();
+    if (matchData.state === "unmatched") {
+      currentMatchState = "unmatched";
+      setChatComposerEnabled(false, "This chat is closed after unmatch.");
+      throw new Error("This chat is closed because the match was removed.");
+    }
+    participants = [matchData.userA, matchData.userB].filter(Boolean);
+    currentChatParticipants = participants;
   }
-
-  const thread = threadSnap.data();
-  const participants = [thread.userA, thread.userB].filter(Boolean);
   if (!participants.includes(currentUser.uid)) {
     throw new Error("You are not part of this conversation");
   }
@@ -929,14 +1445,31 @@ async function sendMessage(matchId, text) {
     threadId:  matchId,
     participants,
     senderUid: currentUser.uid,
-    text:      text.trim().slice(0, 2000),
+    text:      trimmedText,
     createdAt: serverTimestamp()
   });
 
-  await updateDoc(doc(db, "threads", matchId), {
+  const sortedParticipants = [...participants].sort();
+  const senderIsA = sortedParticipants[0] === currentUser.uid;
+
+  const threadPatch = {
     messageCount:  increment(1),
     lastMessageAt: serverTimestamp(),
+    lastSenderUid: currentUser.uid,
+    lastMessagePreview: trimmedText.slice(0, 80),
     updatedAt:     serverTimestamp()
+  };
+
+  if (senderIsA) {
+    threadPatch.unreadCountB = increment(1);
+    threadPatch.lastReadAtA = serverTimestamp();
+  } else {
+    threadPatch.unreadCountA = increment(1);
+    threadPatch.lastReadAtB = serverTimestamp();
+  }
+
+  await updateDoc(doc(db, "threads", matchId), {
+    ...threadPatch
   });
 }
 
@@ -1168,6 +1701,8 @@ async function closeCurrentMatch(closeReason = "not_a_fit") {
     toast("Match ended. You can continue discovering others.", "success", 5000);
   }
 
+  invalidateMatchesCache();
+  invalidateDiscoverActionCache();
   await Promise.all([loadMatches(), loadCandidates(), updateLikeQuotaUI()]);
 }
 
@@ -1193,6 +1728,7 @@ async function revealConsent(matchId) {
   else                              patch.revealB = true;
 
   await updateDoc(matchRef, patch);
+  invalidateMatchesCache();
 
   const updated = (await getDoc(matchRef)).data();
   if (updated.revealA && updated.revealB && updated.state !== "revealed") {
@@ -1575,6 +2111,7 @@ $("profileForm").addEventListener("submit", async (e) => {
       countryOfOrigin: ($("countryOfOrigin").value || "").trim().slice(0, 64),
       visaMonthsLeft:  role === "aupair" ? (Number.isFinite(visaNum) ? visaNum : null) : null,
       about:          ($("about").value          || "").trim().slice(0, 300),
+      serveBucket: bucketFromUid(currentUser.uid),
       profileVisible: true,
       hasMatch,
       matchingState: hasMatch ? "matched" : "discoverable",
@@ -1618,9 +2155,10 @@ document.querySelectorAll(".nav-btn").forEach(btn => {
   btn.addEventListener("click", () => {
     const tab = btn.dataset.tab;
     showTab(tab);
-    if (tab === "matches") loadMatches();
+    if (tab === "matches") loadMatches(false);
     if (tab === "discover") {
       updateLikeQuotaUI();
+      if (discoverRefreshCooldownUntilMs > Date.now()) applyDiscoverRefreshCooldown();
       loadCandidates();
     }
   });
@@ -1628,15 +2166,19 @@ document.querySelectorAll(".nav-btn").forEach(btn => {
 
 $("loadCandidatesBtn").addEventListener("click", async () => {
   if (!currentUser) return;
+
+  if (discoverRefreshCooldownUntilMs > Date.now()) {
+    applyDiscoverRefreshCooldown();
+    return;
+  }
+
   const btn = $("loadCandidatesBtn");
   btn.disabled    = true;
   btn.textContent = "Loading\u2026";
   try {
     await loadCandidates();
-    if (!btn.disabled) {
-      btn.disabled = false;
-      btn.textContent = "Refresh";
-    }
+    discoverRefreshCooldownUntilMs = Date.now() + DISCOVER_REFRESH_COOLDOWN_MS;
+    applyDiscoverRefreshCooldown();
   } catch (err) {
     console.error("Load candidates failed:", err);
     const msg = err.message?.includes("index")
@@ -1649,6 +2191,7 @@ $("loadCandidatesBtn").addEventListener("click", async () => {
 });
 
 $("chatBack").addEventListener("click", () => {
+  stopChatRealtime();
   $("chatPanel").classList.add("hidden");
   $("matchesList").style.removeProperty("display");
   $("view-app").classList.remove("chat-open");
@@ -1672,12 +2215,22 @@ $("sendMessageBtn").addEventListener("click", async () => {
     $("messageText").value = "";
     resizeMessageInput();
     setChatStatus("");
-    await loadMessages(currentMatchId);
   } catch (err) {
     console.error("Send failed:", err);
     setChatStatus(err.message || "Could not send message", "error");
     toast(err.message || "Could not send message", "error", 5000);
   }
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (!currentMatchId) return;
+
+  if (document.hidden) {
+    stopChatRealtime();
+    return;
+  }
+
+  startChatRealtime(currentMatchId);
 });
 
 $("messageText").addEventListener("input", () => {
